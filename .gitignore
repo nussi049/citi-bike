@@ -1,0 +1,11 @@
+.tmp
+data
+citybike.egg-info
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# DuckDB databases
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
