@@ -9,3 +9,4 @@ citybike.egg-info
 *.duckdb
 *.duckdb.wal
 *.duckdb.tmp
+.DS_Store
