@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -14,39 +13,29 @@ import altair as alt
 import folium
 from streamlit_folium import st_folium
 
+from src.dashboard.lib.settings import (
+    BOROUGH_GEOJSON,
+    CRASH_CELL_HOUR,
+    EXPOSURE_CELL_HOUR,
+    GRID_TRAIN,
+    EVAL_2025,
+    MC_2025,
+    COMP,
+)
+
 
 # -----------------------------
 # Page config
 # -----------------------------
 st.set_page_config(page_title="Risk & Exposure (Bike crashes)", layout="wide")
-st.title("Risk & Exposure — Bike crashes (Poisson vs Negative Binomial)")
-
-# -----------------------------
-# Paths
-# -----------------------------
-ROOT = Path(__file__).resolve().parents[3]
-RISK_DIR = ROOT / "data" / "processed" / "risk_hourly_mc"
-PROXY_DIR = ROOT / "data" / "processed" / "proxy_test"
-RAW_DIR = ROOT / "data" / "raw"
-
-CITY_TRAIN = RISK_DIR / "grid_train_cell_hour_2020_2024.parquet"
-
-EVAL_2025 = RISK_DIR / "risk_eval_2025_monthly_bike_all.parquet"
-MC_2025 = RISK_DIR / "risk_mc_2025_totals_bike_all.parquet"
-COMP = RISK_DIR / "model_comparison_bike_all.parquet"
-PROXY_BM = PROXY_DIR / "proxy_test_borough_month.parquet"
-BOROUGH_GEOJSON_PATH = RAW_DIR / "borough_boundaries.geojson"
-
-# UNFILTERED GRID DATA (2020-2025 COMPLETE!)
-CRASH_CELL_HOUR = RISK_DIR / "crash_cell_hour.parquet"
-EXPOSURE_CELL_HOUR = RISK_DIR / "exposure_cell_hour.parquet"
+st.title("Risk & Exposure")
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def read_parquet_safe(path: Path) -> pd.DataFrame:
+def read_parquet_safe(path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     return pd.read_parquet(path)
@@ -172,15 +161,14 @@ year_range_str = f"{min(selected_years)}-{max(selected_years)}" if len(selected_
 
 
 # =============================
-# F) SPATIAL HEATMAPS - COMPLETE DATA 2020-2025 (MOVED TO TOP!)
+# F) SPATIAL HEATMAPS - COMPLETE DATA 2020-2025
 # =============================
 st.subheader(f"Spatial Distribution: NYC Heatmaps ({year_range_str})")
 
 # Load and extract borough boundaries
-if BOROUGH_GEOJSON_PATH.exists():
-    with open(BOROUGH_GEOJSON_PATH, 'r') as f:
+if BOROUGH_GEOJSON.exists():
+    with open(BOROUGH_GEOJSON, 'r') as f:
         borough_geojson = json.load(f)
-    st.success(f"✅ Loaded {len(borough_geojson.get('features', []))} boroughs")
     
     # Extract boundary coordinates as simple lists for PolyLine rendering
     @st.cache_data
@@ -206,9 +194,8 @@ if BOROUGH_GEOJSON_PATH.exists():
         return boundaries
     
     borough_boundaries = extract_borough_boundaries(borough_geojson)
-    st.info(f"📍 Extracted {len(borough_boundaries)} boundary lines")
 else:
-    st.error(f"❌ GeoJSON not found at: {BOROUGH_GEOJSON_PATH}")
+    st.error(f"❌ GeoJSON not found at: {BOROUGH_GEOJSON}")
     borough_boundaries = []
 
 if grid_complete.empty:
@@ -232,7 +219,6 @@ else:
         grid_filtered = grid_filtered[grid_filtered['year'].isin(selected_years)]
         
         total_crashes = grid_filtered['y_bike'].sum()
-        st.success(f"🎯 Filtered to **{total_crashes:,.0f} total crashes** from {len(grid_filtered):,} cell-hours in years {selected_years}")
     else:
         st.warning("⚠️ No timestamp column found - showing all data")
     
@@ -253,9 +239,7 @@ else:
     
     if len(heatmap_data) == 0:
         st.warning("No grid cells with data for visualization.")
-    else:
-        st.info(f"📍 Loaded **{len(heatmap_data):,} grid cells** total")
-        
+    else:        
         # Helper function to create colored map
         def create_nyc_map(data, value_col, title, color_scale='YlOrRd'):
             """Create a folium map with colored grid cells"""
@@ -361,12 +345,6 @@ else:
                 
                 # Show stats about crashes outside CitiBike coverage
                 crashes_no_exposure = crashes_data[crashes_data['exposure_min'] == 0]
-                if len(crashes_no_exposure) > 0:
-                    st.info(
-                        f"ℹ️ **{crashes_no_exposure['y_bike'].sum():,.0f} crashes** "
-                        f"({100*crashes_no_exposure['y_bike'].sum()/crashes_data['y_bike'].sum():.1f}%) "
-                        f"occurred in areas without CitiBike coverage (e.g., Staten Island, outer Bronx)"
-                    )
         
         # TAB 2: EXPOSURE MAP
         with tab2:
@@ -410,7 +388,7 @@ else:
 # NOW THE MODEL SECTIONS (A-E)
 # =============================
 st.markdown("---")
-st.header("Model Analysis & Forecasts")
+st.header("Model Analysis & Forecast")
 
 # -----------------------------
 # Load data (for sections A-E)
@@ -418,11 +396,10 @@ st.header("Model Analysis & Forecasts")
 comp = read_parquet_safe(COMP)
 eval_2025 = read_parquet_safe(EVAL_2025)
 mc_2025 = read_parquet_safe(MC_2025)
-train = read_parquet_safe(CITY_TRAIN)
-proxy_bm = read_parquet_safe(PROXY_BM)
+train = read_parquet_safe(GRID_TRAIN)
 
 missing = []
-for p in [COMP, EVAL_2025, MC_2025, CITY_TRAIN]:
+for p in [COMP, EVAL_2025, MC_2025, GRID_TRAIN]:
     if not p.exists():
         missing.append(str(p))
 
@@ -534,13 +511,11 @@ if "dispersion" in comp_show.columns:
 
 st.dataframe(comp_show, width="stretch")
 
-st.markdown(
-    """
+st.markdown("""
 **How to choose:**
 - If Poisson **dispersion (Pearson χ²/df)** is far above 1, the data are more variable than Poisson allows (overdispersion).
 - Negative Binomial often fits better under overdispersion. Compare **AIC** (lower is better).
-"""
-)
+""")
 
 
 # =============================
@@ -637,19 +612,23 @@ def make_rate_chart(group_col: str, title: str, x_title: str):
             y=alt.Y("rate_100k:Q", title="Crashes per 100k exposure-min"),
             tooltip=[group_col, alt.Tooltip("y:Q", format=",.0f"), alt.Tooltip("exposure_min:Q", format=",.0f"), alt.Tooltip("rate_100k:Q", format=",.3f")],
         )
-        .properties(height=280, title=title)
+        .properties(height=320, title=title)
     )
     return ch
 
 col1, col2 = st.columns(2)
 with col1:
-    st.altair_chart(make_rate_chart("hour_of_day", "Crash rate by hour of day", "Hour of day"), width="stretch")
+    st.altair_chart(make_rate_chart("hour_of_day", "Crash rate by hour of day", "Hour of day"), use_container_width=True)
 with col2:
-    st.altair_chart(make_rate_chart("dow", "Crash rate by day of week (0=Sun)", "Day of week"), width="stretch")
+    st.altair_chart(make_rate_chart("dow", "Crash rate by day of week (0=Sun)", "Day of week"), use_container_width=True)
+
+# Add vertical spacing between chart rows
+st.markdown("")
+st.markdown("")
 
 col3, col4 = st.columns(2)
 with col3:
-    st.altair_chart(make_rate_chart("month", "Crash rate by month", "Month"), width="stretch")
+    st.altair_chart(make_rate_chart("month", "Crash rate by month", "Month"), use_container_width=True)
 
 with col4:
     if 'prcp' in train.columns:
@@ -658,90 +637,44 @@ with col4:
         wdf = wdf.dropna(subset=["prcp"]).copy()
         
         if len(wdf) > 100:
-            wdf["prcp_bin"] = pd.qcut(wdf["prcp"], q=10, duplicates="drop")
-            gb = wdf.groupby("prcp_bin", as_index=False).agg(y=("y_bike","sum"), exposure_min=("exposure_min","sum"))
+            # Simple categories: No rain vs Rain
+            wdf["rain_category"] = pd.cut(
+                wdf["prcp"],
+                bins=[-0.01, 0.01, 1.0, 5.0, float('inf')],
+                labels=["No rain (0 mm)", "Light rain (0-1 mm)", "Moderate rain (1-5 mm)", "Heavy rain (5+ mm)"]
+            )
+            
+            # Aggregate by rain category
+            gb = wdf.groupby("rain_category", as_index=False, observed=True).agg(
+                n_hours=("prcp", "count"),
+                y=("y_bike", "sum"),
+                exposure_min=("exposure_min", "sum")
+            )
+            
+            # Calculate crash rate
             gb["rate_100k"] = gb.apply(lambda r: rate_per_100k(r["y"], r["exposure_min"]), axis=1)
-            gb["prcp_bin_label"] = gb["prcp_bin"].astype(str)
 
+            # EXPLICIT TITLE BEFORE CHART
+            st.markdown("**Crash rate vs precipitation**")
+            
             ch = (
                 alt.Chart(gb)
-                .mark_bar()
+                .mark_line(point=True)
                 .encode(
-                    x=alt.X("prcp_bin_label:N", sort=None, title="Precipitation bin (train quantiles)"),
+                    x=alt.X("rain_category:N", title="Precipitation level", sort=None),
                     y=alt.Y("rate_100k:Q", title="Crashes per 100k exposure-min"),
-                    tooltip=["prcp_bin_label:N", alt.Tooltip("y:Q", format=",.0f"), alt.Tooltip("exposure_min:Q", format=",.0f"), alt.Tooltip("rate_100k:Q", format=",.3f")],
+                    tooltip=[
+                        alt.Tooltip("rain_category:N", title="Category"),
+                        alt.Tooltip("n_hours:Q", format=",", title="Hours in period"),
+                        alt.Tooltip("y:Q", format=",.0f", title="Total crashes"),
+                        alt.Tooltip("rate_100k:Q", format=".2f", title="Crash rate")
+                    ],
                 )
-                .properties(height=280, title="Crash rate vs precipitation (binned)")
+                .properties(height=280)  # Removed title from properties
             )
-            st.altair_chart(ch, width="stretch")
+            st.altair_chart(ch, use_container_width=True)
+            
+        else:
+            st.info("Insufficient data for precipitation analysis")
     else:
         st.info("Weather data not available in training dataset")
-
-st.caption(
-    "**Data source:** Model training data (filtered for reliable predictions). "
-    "These plots show *empirical* rates in areas with sufficient CitiBike exposure. "
-    "The GLM learns a smooth version of these patterns (plus weather effects) to forecast future periods."
-)
-
-
-# =============================
-# G) Borough allocation (optional)
-# =============================
-st.markdown("---")
-st.subheader("G) Borough allocation (optional, using proxy shares)")
-
-if proxy_bm.empty:
-    st.info("Proxy borough-month dataset not found. Skipping borough allocation.")
-else:
-    pbm = proxy_bm.copy()
-    if "month_ts" in pbm.columns:
-        pbm["month_ts"] = pd.to_datetime(pbm["month_ts"])
-    elif "month" in pbm.columns:
-        pbm["month_ts"] = pd.to_datetime(pbm["month"])
-    else:
-        st.info("Proxy dataset has no recognizable month column. Skipping.")
-        pbm = pd.DataFrame()
-
-    if not pbm.empty and "borough" in pbm.columns and "share_idx" in pbm.columns:
-        pbm["borough"] = pbm["borough"].astype(str).str.upper()
-        pbm["share_idx"] = pd.to_numeric(pbm["share_idx"], errors="coerce")
-
-        pbm_2024 = pbm[(pbm["month_ts"] >= "2024-01-01") & (pbm["month_ts"] < "2025-01-01")].copy()
-        if pbm_2024.empty:
-            st.warning("No 2024 proxy data found; using all available months as weights.")
-            weights = pbm.groupby("borough", as_index=False)["share_idx"].mean()
-        else:
-            weights = pbm_2024.groupby("borough", as_index=False)["share_idx"].mean()
-
-        weights = weights.dropna(subset=["share_idx"]).copy()
-        weights["w"] = weights["share_idx"] / weights["share_idx"].sum()
-
-        model_choice = st.radio("Allocate using model:", ["neg_bin", "poisson"], horizontal=True, index=0)
-
-        annual_pred = float(pred_2025.loc[pred_2025["model"] == model_choice, "pred_total_2025"].iloc[0]) if (pred_2025["model"] == model_choice).any() else float("nan")
-        if math.isnan(annual_pred) or annual_pred <= 0:
-            st.warning("Could not compute annual prediction for the selected model.")
-        else:
-            alloc = weights.copy()
-            alloc["pred_2025_alloc"] = alloc["w"] * annual_pred
-            alloc = alloc.sort_values("pred_2025_alloc", ascending=False)
-
-            st.markdown("**Allocated annual 2025 prediction (using proxy weights):**")
-            ch = (
-                alt.Chart(alloc)
-                .mark_bar()
-                .encode(
-                    x=alt.X("borough:N", title="Borough", sort="-y"),
-                    y=alt.Y("pred_2025_alloc:Q", title="Allocated crashes (2025 total)"),
-                    tooltip=["borough:N", alt.Tooltip("w:Q", format=".3f", title="weight"), alt.Tooltip("pred_2025_alloc:Q", format=",.0f")],
-                )
-                .properties(height=320)
-            )
-            st.altair_chart(ch, width="stretch")
-
-            st.caption(
-                "Allocation uses borough-level proxy weights (share index). "
-                "This is not an attribution of specific crashes to Citi Bike—it's a distribution of the *citywide* forecast according to exposure shares."
-            )
-    else:
-        st.info("Proxy dataset missing required columns (borough, share_idx). Skipping.")
