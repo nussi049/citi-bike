@@ -89,7 +89,7 @@ This can cause numerical issues in GLM fitting.
 ### Solution: Z-Score Normalization
 
 ```python
-# Training statistics (computed once from 2020-2024 data)
+# Training statistics (computed once from 2021-2024 data)
 lat_mean = 40.77
 lat_std  = 0.04
 lng_mean = -73.96

@@ -154,7 +154,7 @@ Analyze historical bike crash patterns across NYC.
 Model results, spatial analysis, and predictions.
 
 **Filters (Sidebar):**
-- Year selection for heatmaps (2020-2025)
+- Year selection for heatmaps (2021-2025)
 
 **Visualizations:**
 
@@ -223,7 +223,7 @@ See [src/modeling/README.md](src/modeling/README.md) for detailed model document
 | Step | Command | Description |
 |------|---------|-------------|
 | 1 | `make data` | Download crashes, trips, weather, boundaries |
-| 2 | `make clean-data` | Clean and filter data (2020-2025) |
+| 2 | `make clean-data` | Clean and filter data (2021-2025) |
 | 3 | `make proxy-test` | Validate CitiBike as cycling proxy |
 | 4 | `make mart` | Build dashboard data marts |
 | 5 | `make modeling` | Fit GLM, run Monte Carlo simulations |
