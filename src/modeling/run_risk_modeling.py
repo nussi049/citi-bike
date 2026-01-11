@@ -6,9 +6,9 @@ This script fits a Poisson GLM to predict bike crashes
 using CitiBike exposure as a feature. It implements:
 
 1. TEMPORAL SEPARATION: Train on 2021-2024 (excludes COVID 2020), test on 2025
-2. GRID-LEVEL MODELING: 64 spatial cells × daily resolution
+2. GRID-LEVEL MODELING: Spatial cells × daily resolution
 3. UNCERTAINTY QUANTIFICATION: Monte Carlo with parameter + weather bootstrap
-4. EXPOSURE SCENARIOS: -10%, actual, +10% sensitivity analysis
+4. EXPOSURE SCENARIOS: Sensitivity analysis with historical exposure patterns
 
 INPUTS:
     - data/interim/tripdata_2013_2025_clean.parquet  (from clean_data.py)
@@ -60,7 +60,7 @@ MODEL SPECIFICATION:
             grid_lng_norm = (grid_lng - lng_mean) / lng_std
 
         This prevents numerical issues in GLM fitting due to small variance
-        across the ~64 active grid cells.
+        across the active grid cells.
 
     Family: Poisson (dispersion ~1, no overdispersion)
     Training: 2021-2024 (4 years, excludes COVID 2020)

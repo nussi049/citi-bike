@@ -16,14 +16,7 @@ The model predicts bicycle crashes in NYC based on:
 
 ### Why Daily Instead of Hourly?
 
-The model uses **daily** aggregation for memory efficiency:
-
-| Aggregation | Training Rows | 2025 Rows | RAM Usage |
-|-------------|---------------|-----------|-----------|
-| Hourly | ~2.8M | ~560K | ~500 MB+ (crashes) |
-| **Daily** | **~117K** | **~23K** | **~20 MB** |
-
-This 24x reduction in data size allows the model to run on 8GB RAM machines without memory issues.
+The model uses **daily** aggregation for memory efficiency. This ~24x reduction in data size allows the model to run on 8GB RAM machines without memory issues.
 
 **Important:** Hour-of-day patterns are still shown in the dashboard from raw hourly data. The model simply doesn't use hour-of-day as a predictor.
 
@@ -45,7 +38,6 @@ We model risk **not** at exact coordinate level, but at **cell level**. This is 
 |-----------|-------|
 | Cell size | 0.025 x 0.025 deg |
 | Real size | ~2.5 km x 2.5 km |
-| Active cells | ~64 (with CitiBike exposure) |
 
 ### The Binning Process
 
@@ -194,7 +186,7 @@ This ensures an apples-to-apples comparison. Without this, the model would predi
 
 ```
 cells_keep (training)     cells_2025 (evaluation)
-        64 cells    --->   ~60-64 cells (with 2025 exposure)
+     N cells          --->   subset with 2025 exposure
 ```
 
 ### Why This Matters for Insurance
@@ -314,30 +306,11 @@ This is more realistic than the offset approach where +10% exposure always means
 
 ### 2025 Evaluation
 
-| Metric | Value |
-|--------|-------|
-| Observed (in model cells) | ~5,549 crashes |
-| Predicted (Poisson) | ~6,104 crashes |
-| Difference | ~+10% overprediction |
+The model predicts crash counts for 2025, which can be compared against observed data. Note that:
 
-### Possible Explanations for Overprediction
-
-1. **Reporting Delays (Nachmeldelücken)**: Late 2025 crashes (Nov/Dec) may not be fully reported yet as of early 2026.
-
-2. **2025 was an unusual year**: Total NYC crashes in 2025 (6,912) were below the 2021-2024 average (7,732):
-
-| Year | Total Crashes (NYC) |
-|------|---------------------|
-| 2021 | 7,854 |
-| 2022 | 7,883 |
-| 2023 | 7,959 |
-| 2024 | 7,231 |
-| **2025** | **6,912** |
-| Avg 2021-24 | 7,732 |
-
-The model, trained on 2021-2024, naturally predicts closer to historical averages.
-
-3. **Trend extrapolation**: The trend variable captures declining crash rates, but 2025 may have declined faster than the historical trend predicted.
+1. **Reporting Delays**: Late 2025 crashes may not be fully reported yet.
+2. **Year-to-year variation**: Crash totals vary year to year based on many factors.
+3. **Trend extrapolation**: The trend variable captures historical patterns but may not perfectly predict future changes.
 
 ---
 
