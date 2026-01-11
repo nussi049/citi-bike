@@ -16,10 +16,10 @@ A Streamlit dashboard with three pages for exploring NYC bike data:
 
 ### 2. Risk Prediction Model
 
-A Negative Binomial GLM that predicts bike crash risk:
+A Poisson GLM that predicts bike crash risk:
 - Uses CitiBike trip minutes as proxy for cycling exposure
-- Accounts for time (hour, day, month), location (grid cells), and weather
-- Achieves ~3% prediction error on out-of-sample 2025 data
+- Accounts for time (day of week, month), location (grid cells), and weather
+- Trained on daily data (2021-2024, excludes COVID year 2020), tested on 2025
 
 ## Key Features
 
@@ -30,10 +30,14 @@ A Negative Binomial GLM that predicts bike crash risk:
 - Weather impact analysis (temperature, precipitation, snow)
 
 **Model:**
-- Spatial grid model: ~64 cells × hourly resolution
-- Exposure-based: crash *rate* per cycling minute, not just counts
-- Monte Carlo uncertainty quantification with weather bootstrap
-- Exposure scenarios: -10%, actual, +10% sensitivity analysis
+- Spatial grid model: ~64 cells at daily resolution
+- Exposure as feature (not offset): crash rate with estimated elasticity
+- Monte Carlo uncertainty quantification (S=1000) with 4 uncertainty dimensions:
+  - Weather bootstrap (2021-2025)
+  - Exposure year scenarios (2021-2025)
+  - Growth factor uncertainty (±20%)
+  - Parameter sampling from coefficient distribution
+  
 
 ## Project Structure
 
@@ -77,7 +81,7 @@ Or run individual steps:
 ```bash
 make data        # Download all raw data
 make clean-data  # Clean trip/crash data
-make modeling    # Run risk modeling (~15-20 min)
+make modeling    # Run risk modeling (~2-3 min)
 make dashboard   # Start Streamlit dashboard
 ```
 
@@ -156,8 +160,8 @@ Model results, spatial analysis, and predictions.
 
 | Section | Charts | Description |
 |---------|--------|-------------|
-| **Spatial Heatmaps** | 3 interactive Folium maps | Grid cells colored by: (1) total crashes, (2) total exposure minutes, (3) crash rate per 100k minutes |
-| **Model Comparison** | Table + metrics | Poisson vs Negative Binomial: AIC, dispersion, alpha parameter |
+| **Spatial Heatmaps** | 3 interactive Folium maps | Grid cells colored by: (1) total crashes, (2) total exposure minutes, (3) model coverage + bike counters |
+| **Poisson Diagnostics** | Table + metrics | AIC, dispersion, coefficient estimates |
 | **2025 Predictions** | Distribution chart | Monte Carlo simulation results with median and 90% confidence interval |
 | **Observed vs Predicted** | Monthly comparison | Actual 2025 crashes vs model predictions by month |
 | **Exposure Scenarios** | Comparison chart | Predicted crashes under -10%, actual, +10% exposure scenarios |
@@ -165,7 +169,7 @@ Model results, spatial analysis, and predictions.
 
 **Heatmap Details:**
 
-The spatial heatmaps use a 0.025° × 0.025° grid (~2.5 km cells) with:
+The spatial heatmaps use a 0.025° x 0.025° grid (~2.5 km cells) with:
 - Color scale from green (low) to red (high)
 - Hover tooltips showing exact values
 - NYC borough boundaries overlay
@@ -185,21 +189,32 @@ The spatial heatmaps use a 0.025° × 0.025° grid (~2.5 km cells) with:
 
 ## Model Overview
 
-The model predicts crash counts using a Negative Binomial GLM:
+The model predicts crash counts using a **Poisson GLM** trained on **daily** data:
 
 ```
-y_bike ~ C(hour) + C(dow) + C(month)
-       + lat_n + lng_n + lat_n² + lng_n² + lat_n×lng_n
-       + trend
+y_bike ~ C(dow) + C(month)
+       + grid_lat_norm + grid_lng_norm + lat2 + lng2 + lat_lng
        + temp + prcp + snow + wspd
-       + offset(log(exposure_min))
+       + trend
+       + log1p_exposure
 
 where:
-  lat_n, lng_n = normalized grid cell coordinates
-  exposure_min = CitiBike minutes in cell/hour
+  grid_lat_norm, grid_lng_norm = normalized grid cell coordinates
+  trend = (day_ts - 2021-01-01).days / 365.25  (years since training start)
+  log1p_exposure = log(exposure_min + 1)  (handles exposure=0)
 ```
 
-**Key insight:** The offset term means we model crash *rate* per minute of cycling, not just crash counts. This accounts for varying cycling activity across locations and times.
+**Key Design Decisions:**
+
+1. **Daily Aggregation**: Model trained on daily data (~117K rows) instead of hourly (~2.8M rows) for memory efficiency. Hour-of-day patterns are shown in dashboard from raw data.
+
+2. **Poisson Model**: The data shows dispersion ~1 (practically no overdispersion), so a simple Poisson GLM is sufficient. No Negative Binomial needed.
+
+3. **Exposure as Feature**: The `log1p_exposure` term is a feature with estimated coefficient (β ≈ 0.4-0.7), not a fixed offset. This allows predictions for hours with zero exposure and captures diminishing returns.
+
+4. **Evaluation Consistency**: Predictions and observed crashes use the **same cell set** (cells with 2025 exposure). This ensures apples-to-apples comparison.
+
+5. **Training Period**: 2021-2024 (excludes COVID year 2020 due to anomalous patterns).
 
 See [src/modeling/README.md](src/modeling/README.md) for detailed model documentation.
 
@@ -216,13 +231,33 @@ See [src/modeling/README.md](src/modeling/README.md) for detailed model document
 
 ## Results
 
-- **Training Period**: 2020-2024 (5 years)
+- **Training Period**: 2021-2024 (4 years, daily aggregation, excludes COVID 2020)
 - **Test Period**: 2025 (out-of-sample)
-- **Model**: Negative Binomial (handles overdispersion)
-- **Accuracy**: ~3% error on 2025 total crash prediction
+- **Model**: Poisson GLM (dispersion ~1, no overdispersion)
+- **Prediction**: ~6,100 crashes (Predicted) vs ~5,550 crashes (Observed in model cells)
+
+**Note on 2025 Observed Data:**
+
+The observed crash count for 2025 (~5,550 in model cells) appears lower than model predictions (~6,100). This may be partly explained by:
+
+1. **Reporting Delays (Nachmeldelücken)**: Crash data from late 2025 (Nov/Dec) may not yet be fully reported as of early 2026.
+
+2. **2025 was an unusual year**: Total NYC bike crashes in 2025 (6,912) were below the 2021-2024 average (7,732):
+
+| Year | Total Crashes |
+|------|---------------|
+| 2021 | 7,854 |
+| 2022 | 7,883 |
+| 2023 | 7,959 |
+| 2024 | 7,231 |
+| **2025** | **6,912** |
+| Avg 2021-24 | 7,732 |
+
+The model, trained on 2021-2024 data, naturally predicts closer to historical averages.
 
 ## Requirements
 
 - Python 3.10+
 - ~20 GB disk space for data
-- ~20 minutes for full pipeline
+- ~8 GB RAM (optimized for memory efficiency)
+- ~5 minutes for full pipeline

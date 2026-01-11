@@ -36,7 +36,7 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 # CORE CLEANED DATASETS (from clean_data.py)
 # =============================================================================
 # Bike-related crashes with imputed coordinates
-CRASHES_BIKE = PROCESSED_DIR / "crashes_bike_clean.parquet"
+CRASHES_BIKE = INTERIM_DIR / "crashes_bike_clean.parquet"
 
 # NYC borough boundaries for spatial visualizations
 BOROUGH_GEOJSON = RAW_DIR / "borough_boundaries.geojson"

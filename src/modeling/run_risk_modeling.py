@@ -2,17 +2,17 @@
 """
 run_risk_modeling.py - NYC Bike Crash Risk Modeling Pipeline
 
-This script fits Poisson and Negative Binomial GLMs to predict bike crashes
-using CitiBike exposure as an offset. It implements:
+This script fits a Poisson GLM to predict bike crashes
+using CitiBike exposure as a feature. It implements:
 
-1. TEMPORAL SEPARATION: Train on 2020-2024, test on 2025
-2. GRID-LEVEL MODELING: 64 spatial cells × hourly resolution
+1. TEMPORAL SEPARATION: Train on 2021-2024 (excludes COVID 2020), test on 2025
+2. GRID-LEVEL MODELING: 64 spatial cells × daily resolution
 3. UNCERTAINTY QUANTIFICATION: Monte Carlo with parameter + weather bootstrap
 4. EXPOSURE SCENARIOS: -10%, actual, +10% sensitivity analysis
 
 INPUTS:
     - data/interim/tripdata_2013_2025_clean.parquet  (from clean_data.py)
-    - data/processed/crashes_bike_clean.parquet       (from clean_data.py)
+    - data/interim/crashes_bike_clean.parquet        (from clean_data.py)
     - data/raw/weather_hourly_openmeteo/**/*.parquet
 
 OUTPUTS (used by dashboard):
@@ -31,9 +31,17 @@ OUTPUTS (used by dashboard):
 MODEL SPECIFICATION:
     y_bike ~ C(hour) + C(dow) + C(month)
            + grid_lat_norm + grid_lng_norm + grid_lat_norm² + grid_lng_norm² + grid_lat_norm×grid_lng_norm
-           + trend
            + temp + prcp + snow + wspd
-           + offset(log(exposure_min))
+           + trend
+           + log1p_exposure
+
+    NOTE: Exposure is modeled as a FEATURE (not offset), allowing:
+    - Training on ALL crashes (including hours without CitiBike exposure)
+    - Estimation of exposure coefficient β (not fixed at 1)
+    - Testing whether exposure is a significant predictor
+
+    log1p_exposure = log(exposure_min + 1)  # handles exposure=0
+    trend = (hour_ts - TMIN).days / 365.25 (normalized to years since start of training)
 
     SPATIAL BINNING (Grid System):
         Raw crash/trip coordinates are binned into 0.025° × 0.025° grid cells
@@ -54,8 +62,8 @@ MODEL SPECIFICATION:
         This prevents numerical issues in GLM fitting due to small variance
         across the ~64 active grid cells.
 
-    Family: Negative Binomial (accounts for overdispersion)
-    Training: 2020-2024 (temporal separation)
+    Family: Poisson (dispersion ~1, no overdispersion)
+    Training: 2021-2024 (4 years, excludes COVID 2020)
     Testing: 2025 (true out-of-sample)
 
 Usage:
@@ -77,7 +85,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 # INPUTS
 # -----------------------------
 TRIPS = PROJECT_ROOT / "data" / "interim" / "tripdata_2013_2025_clean.parquet"
-CRASH_BIKE = PROJECT_ROOT / "data" / "processed" / "crashes_bike_clean.parquet"
+CRASH_BIKE = PROJECT_ROOT / "data" / "interim" / "crashes_bike_clean.parquet"
 WEATHER_HOURLY_DIR = PROJECT_ROOT / "data" / "raw" / "weather_hourly_openmeteo"
 
 # -----------------------------
@@ -93,7 +101,7 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 # GRID + WINDOW
 # -----------------------------
 GRID_DEG = 0.025
-TMIN = "2020-01-01"
+TMIN = "2021-01-01"  # Excludes COVID year 2020 (had highest summer crash rate)
 TMAX_TRAIN = "2025-01-01"  # Training: 2020-2024 only
 TMAX = "2026-01-01"        # For exposure data collection
 
@@ -109,12 +117,16 @@ con.execute(f"PRAGMA temp_directory='{TMP_DIR.as_posix()}';")
 # Forcing rebuild prevents "same fit" due to cached files.
 FORCE_REBUILD = True
 
-# To make grid-model feasible: keep cells covering X% of total exposure (train window).
-CELL_COVERAGE = 1.0    # 0.95..0.995 (higher => more cells => slower)
+# Cell selection strategy: keep cells covering X% of total CRASHES (not exposure!)
+# Exposure-based selection was problematic: 80% exposure = only 37% crashes
+# Crash-based selection ensures we cover most crashes:
+#   80% crash coverage = ~50 cells (manageable for GLM)
+#   90% crash coverage = ~77 cells (may cause OOM)
+CRASH_COVERAGE = 1.00   # Target ALL cells with CitiBike exposure (~140 cells, ~94% crashes)
 
 print("DuckDB:", DB_PATH)
-print("GRID_DEG:", GRID_DEG, "| FORCE_REBUILD:", FORCE_REBUILD, "| CELL_COVERAGE:", CELL_COVERAGE)
-print("Training:", TMIN, "→", TMAX_TRAIN)
+print("GRID_DEG:", GRID_DEG, "| FORCE_REBUILD:", FORCE_REBUILD, "| CRASH_COVERAGE:", CRASH_COVERAGE)
+print("Training:", TMIN, "→", TMAX_TRAIN, "(4 years, excludes COVID 2020)")
 print("Testing: 2025-01-01 → 2026-01-01")
 print("Exposure collection:", TMIN, "→", TMAX)
 
@@ -227,128 +239,192 @@ if FORCE_REBUILD:
         exposure_test_path.unlink()
         print("Deleted:", exposure_test_path)
 
+# ============================================================================
+# LINE INTERPOLATION FOR EXPOSURE
+# ============================================================================
+# Instead of assigning all exposure to the start station cell, we distribute
+# it across all cells along the straight line between start and end station.
+# This captures mid-route exposure and expands coverage to more cells.
+#
+# Approach:
+#   1. Interpolate N points along the line from start to end
+#   2. Bin each point to a grid cell
+#   3. Get unique cells traversed
+#   4. Distribute trip duration equally across all cells
+# ============================================================================
+N_INTERP_POINTS = 5  # Number of interpolation points (including start/end)
+
 # Build training exposure (2020-2024 only)
 if exposure_train_path.exists():
     print("Exists, skipping:", exposure_train_path)
 else:
-    # Process year-by-year to manage memory
-    print(f"Creating TRAINING exposure (year-by-year) for {TMIN} to {TMAX_TRAIN}...")
+    # Process quarter-by-quarter to manage memory (interpolation uses more RAM)
+    print(f"Creating TRAINING exposure with LINE INTERPOLATION for {TMIN} to {TMAX_TRAIN}...")
+    print(f"Using {N_INTERP_POINTS} interpolation points per trip")
 
     # Extract year range for TRAINING data only
     import datetime
     year_min = datetime.datetime.fromisoformat(TMIN).year
     year_max = datetime.datetime.fromisoformat(TMAX_TRAIN).year - 1  # 2024
-    years = range(year_min, year_max + 1)
 
     temp_files = []
 
-    for year in years:
-        year_start = max(f"{year}-01-01", TMIN)  # Don't go before TMIN
-        if year == year_max:
-            year_end = TMAX_TRAIN  # Use TMAX_TRAIN for last year (2024 → 2025-01-01)
-        else:
-            year_end = f"{year+1}-01-01"
+    for year in range(year_min, year_max + 1):
+        for quarter in range(1, 5):
+            q_start_month = (quarter - 1) * 3 + 1
+            q_end_month = quarter * 3 + 1
 
-        temp_path = OUT_DIR / f"_temp_exp_{year}.parquet"
-        temp_files.append(temp_path)
+            if quarter == 4:
+                if year == year_max:
+                    q_start = f"{year}-10-01"
+                    q_end = TMAX_TRAIN
+                else:
+                    q_start = f"{year}-10-01"
+                    q_end = f"{year+1}-01-01"
+            else:
+                q_start = f"{year}-{q_start_month:02d}-01"
+                q_end = f"{year}-{q_end_month:02d}-01"
 
-        if temp_path.exists():
-            print(f"  Year {year}: already exists, skipping")
-            continue
+            # Skip quarters before TMIN
+            if q_end <= TMIN:
+                continue
+            q_start = max(q_start, TMIN)
 
-        print(f"  Processing year {year} ({year_start} to {year_end})...")
+            temp_path = OUT_DIR / f"_temp_exp_{year}_Q{quarter}.parquet"
+            temp_files.append(temp_path)
 
-        # Assign ALL exposure to start station cell only
+            if temp_path.exists():
+                print(f"  {year} Q{quarter}: already exists, skipping")
+                continue
+
+            print(f"  Processing {year} Q{quarter} ({q_start} to {q_end})...")
+
+            # Line interpolation: distribute exposure across all cells along the route
+            con.execute(f"""
+            COPY (
+              WITH trips AS (
+                SELECT
+                  try_cast(started_at AS TIMESTAMP) AS started_at,
+                  try_cast(ended_at   AS TIMESTAMP) AS ended_at,
+                  start_lat, start_lng,
+                  end_lat, end_lng,
+                  duration_sec
+                FROM read_parquet('{TRIPS.as_posix()}')
+                WHERE try_cast(started_at AS TIMESTAMP) >= TIMESTAMP '{q_start}'
+                  AND try_cast(started_at AS TIMESTAMP) <  TIMESTAMP '{q_end}'
+                  AND start_lat IS NOT NULL AND start_lng IS NOT NULL
+                  AND end_lat IS NOT NULL AND end_lng IS NOT NULL
+                  AND ended_at IS NOT NULL
+                  AND duration_sec IS NOT NULL
+                  AND duration_sec > 0
+                  AND duration_sec < 4*60*60
+              ),
+              -- Generate interpolation points along the line
+              interp_points AS (
+                SELECT
+                  started_at, ended_at, duration_sec,
+                  -- Interpolate: start + t * (end - start) for t in [0, 1]
+                  start_lat + (gs.t / {N_INTERP_POINTS - 1}.0) * (end_lat - start_lat) AS interp_lat,
+                  start_lng + (gs.t / {N_INTERP_POINTS - 1}.0) * (end_lng - start_lng) AS interp_lng
+                FROM trips
+                CROSS JOIN generate_series(0, {N_INTERP_POINTS - 1}) AS gs(t)
+              ),
+              -- Bin each interpolated point to grid cell
+              binned_points AS (
+                SELECT
+                  started_at, ended_at, duration_sec,
+                  floor(interp_lat / {GRID_DEG}) * {GRID_DEG} AS grid_lat,
+                  floor(interp_lng / {GRID_DEG}) * {GRID_DEG} AS grid_lng
+                FROM interp_points
+              ),
+              -- Get unique cells per trip and count them
+              unique_cells_per_trip AS (
+                SELECT
+                  started_at, ended_at, duration_sec,
+                  grid_lat, grid_lng,
+                  COUNT(*) OVER (PARTITION BY started_at, ended_at, duration_sec) AS n_cells
+                FROM (
+                  SELECT DISTINCT started_at, ended_at, duration_sec, grid_lat, grid_lng
+                  FROM binned_points
+                ) sub
+              ),
+              -- Distribute duration equally across cells
+              exposure_per_cell AS (
+                SELECT
+                  started_at, ended_at,
+                  grid_lat, grid_lng,
+                  CAST(floor(grid_lat / {GRID_DEG}) * {GRID_DEG} AS VARCHAR) || '_' ||
+                  CAST(floor(grid_lng / {GRID_DEG}) * {GRID_DEG} AS VARCHAR) AS cell_id,
+                  duration_sec / n_cells AS cell_duration_sec
+                FROM unique_cells_per_trip
+              ),
+              -- Expand to hourly buckets
+              expanded AS (
+                SELECT
+                  cell_id, grid_lat, grid_lng,
+                  gs AS hour_ts,
+                  started_at, ended_at, cell_duration_sec
+                FROM exposure_per_cell
+                CROSS JOIN generate_series(
+                  date_trunc('hour', started_at),
+                  date_trunc('hour', ended_at),
+                  INTERVAL '1 hour'
+                ) AS t(gs)
+              ),
+              -- Calculate overlap with each hour
+              overlap AS (
+                SELECT
+                  cell_id, grid_lat, grid_lng, hour_ts,
+                  GREATEST(
+                    0,
+                    (cell_duration_sec / NULLIF(EXTRACT(EPOCH FROM ended_at - started_at), 0)) *
+                    EXTRACT(EPOCH FROM LEAST(ended_at, hour_ts + INTERVAL '1 hour')
+                                  - GREATEST(started_at, hour_ts))
+                  ) AS overlap_sec
+                FROM expanded
+              )
+              SELECT
+                hour_ts,
+                CAST(grid_lat AS DOUBLE) AS grid_lat,
+                CAST(grid_lng AS DOUBLE) AS grid_lng,
+                cell_id,
+                SUM(overlap_sec)/60.0 AS exposure_min
+              FROM overlap
+              WHERE overlap_sec > 0
+              GROUP BY 1,2,3,4
+            )
+            TO '{temp_path.as_posix()}'
+            (FORMAT PARQUET);
+            """)
+
+    # Combine all quarters and filter to strictly < 2025-01-01
+    print("  Combining training quarters (filtering to < 2025-01-01)...")
+    existing_files = [f for f in temp_files if f.exists()]
+    if existing_files:
+        all_files = "', '".join([f.as_posix() for f in existing_files])
         con.execute(f"""
         COPY (
-          WITH trips AS (
-            SELECT
-              try_cast(started_at AS TIMESTAMP) AS started_at,
-              try_cast(ended_at   AS TIMESTAMP) AS ended_at,
-              start_lat, start_lng,
-              duration_sec
-            FROM read_parquet('{TRIPS.as_posix()}')
-            WHERE try_cast(started_at AS TIMESTAMP) >= TIMESTAMP '{year_start}'
-              AND try_cast(started_at AS TIMESTAMP) <  TIMESTAMP '{year_end}'
-              AND start_lat IS NOT NULL AND start_lng IS NOT NULL
-              AND ended_at IS NOT NULL
-              AND duration_sec IS NOT NULL
-              AND duration_sec > 0
-              AND duration_sec < 4*60*60
-          ),
-          binned AS (
-            SELECT
-              floor(start_lat / {GRID_DEG}) * {GRID_DEG} AS grid_lat,
-              floor(start_lng / {GRID_DEG}) * {GRID_DEG} AS grid_lng,
-              CAST(floor(start_lat / {GRID_DEG}) * {GRID_DEG} AS VARCHAR) || '_' ||
-              CAST(floor(start_lng / {GRID_DEG}) * {GRID_DEG} AS VARCHAR) AS cell_id,
-              started_at,
-              ended_at
-            FROM trips
-          ),
-          expanded AS (
-            SELECT
-              cell_id, grid_lat, grid_lng,
-              gs AS hour_ts,
-              started_at, ended_at
-            FROM binned
-            CROSS JOIN generate_series(
-              date_trunc('hour', started_at),
-              date_trunc('hour', ended_at),
-              INTERVAL '1 hour'
-            ) AS t(gs)
-          ),
-          overlap AS (
-            SELECT
-              cell_id, grid_lat, grid_lng, hour_ts,
-              GREATEST(
-                0,
-                EXTRACT(EPOCH FROM LEAST(ended_at, hour_ts + INTERVAL '1 hour')
-                              - GREATEST(started_at, hour_ts))
-              ) AS overlap_sec
-            FROM expanded
-          )
-          SELECT
-            hour_ts,
-            CAST(grid_lat AS DOUBLE) AS grid_lat,
-            CAST(grid_lng AS DOUBLE) AS grid_lng,
-            cell_id,
-            SUM(overlap_sec)/60.0 AS exposure_min
-          FROM overlap
-          WHERE overlap_sec > 0
-          GROUP BY 1,2,3,4
+          SELECT * FROM read_parquet(['{all_files}'])
+          WHERE hour_ts < TIMESTAMP '2025-01-01'
         )
-        TO '{temp_path.as_posix()}'
+        TO '{exposure_train_path.as_posix()}'
         (FORMAT PARQUET);
         """)
 
-    # Combine all years and filter to strictly < 2025-01-01
-    # (trips starting on 2024-12-31 23:xx can generate exposure in 2025-01-01 via generate_series)
-    print("  Combining training years (filtering to < 2025-01-01)...")
-    all_files = "', '".join([f.as_posix() for f in temp_files if f.exists()])
-    con.execute(f"""
-    COPY (
-      SELECT * FROM read_parquet(['{all_files}'])
-      WHERE hour_ts < TIMESTAMP '2025-01-01'
-    )
-    TO '{exposure_train_path.as_posix()}'
-    (FORMAT PARQUET);
-    """)
-
-    # Cleanup
-    for f in temp_files:
-        if f.exists():
-            f.unlink()
+        # Cleanup
+        for f in temp_files:
+            if f.exists():
+                f.unlink()
 
     print("Wrote:", exposure_train_path)
 
-# Build test exposure (2025 only)
+# Build test exposure (2025 only) - with same line interpolation
 if exposure_test_path.exists():
     print("Exists, skipping:", exposure_test_path)
 else:
-    print(f"Creating TEST exposure for 2025...")
+    print(f"Creating TEST exposure for 2025 with LINE INTERPOLATION...")
 
-    # Assign ALL exposure to start station cell only (same as training)
+    # Line interpolation: distribute exposure across all cells along the route
     con.execute(f"""
     COPY (
       WITH trips AS (
@@ -356,43 +432,77 @@ else:
           try_cast(started_at AS TIMESTAMP) AS started_at,
           try_cast(ended_at   AS TIMESTAMP) AS ended_at,
           start_lat, start_lng,
+          end_lat, end_lng,
           duration_sec
         FROM read_parquet('{TRIPS.as_posix()}')
         WHERE try_cast(started_at AS TIMESTAMP) >= TIMESTAMP '2025-01-01'
           AND try_cast(started_at AS TIMESTAMP) <  TIMESTAMP '2026-01-01'
           AND start_lat IS NOT NULL AND start_lng IS NOT NULL
+          AND end_lat IS NOT NULL AND end_lng IS NOT NULL
           AND ended_at IS NOT NULL
           AND duration_sec IS NOT NULL
           AND duration_sec > 0
           AND duration_sec < 4*60*60
       ),
-      binned AS (
+      -- Generate interpolation points along the line
+      interp_points AS (
         SELECT
-          floor(start_lat / {GRID_DEG}) * {GRID_DEG} AS grid_lat,
-          floor(start_lng / {GRID_DEG}) * {GRID_DEG} AS grid_lng,
-          CAST(floor(start_lat / {GRID_DEG}) * {GRID_DEG} AS VARCHAR) || '_' ||
-          CAST(floor(start_lng / {GRID_DEG}) * {GRID_DEG} AS VARCHAR) AS cell_id,
-          started_at,
-          ended_at
+          started_at, ended_at, duration_sec,
+          -- Interpolate: start + t * (end - start) for t in [0, 1]
+          start_lat + (gs.t / {N_INTERP_POINTS - 1}.0) * (end_lat - start_lat) AS interp_lat,
+          start_lng + (gs.t / {N_INTERP_POINTS - 1}.0) * (end_lng - start_lng) AS interp_lng
         FROM trips
+        CROSS JOIN generate_series(0, {N_INTERP_POINTS - 1}) AS gs(t)
       ),
+      -- Bin each interpolated point to grid cell
+      binned_points AS (
+        SELECT
+          started_at, ended_at, duration_sec,
+          floor(interp_lat / {GRID_DEG}) * {GRID_DEG} AS grid_lat,
+          floor(interp_lng / {GRID_DEG}) * {GRID_DEG} AS grid_lng
+        FROM interp_points
+      ),
+      -- Get unique cells per trip and count them
+      unique_cells_per_trip AS (
+        SELECT
+          started_at, ended_at, duration_sec,
+          grid_lat, grid_lng,
+          COUNT(*) OVER (PARTITION BY started_at, ended_at, duration_sec) AS n_cells
+        FROM (
+          SELECT DISTINCT started_at, ended_at, duration_sec, grid_lat, grid_lng
+          FROM binned_points
+        ) sub
+      ),
+      -- Distribute duration equally across cells
+      exposure_per_cell AS (
+        SELECT
+          started_at, ended_at,
+          grid_lat, grid_lng,
+          CAST(floor(grid_lat / {GRID_DEG}) * {GRID_DEG} AS VARCHAR) || '_' ||
+          CAST(floor(grid_lng / {GRID_DEG}) * {GRID_DEG} AS VARCHAR) AS cell_id,
+          duration_sec / n_cells AS cell_duration_sec
+        FROM unique_cells_per_trip
+      ),
+      -- Expand to hourly buckets
       expanded AS (
         SELECT
           cell_id, grid_lat, grid_lng,
           gs AS hour_ts,
-          started_at, ended_at
-        FROM binned
+          started_at, ended_at, cell_duration_sec
+        FROM exposure_per_cell
         CROSS JOIN generate_series(
           date_trunc('hour', started_at),
           date_trunc('hour', ended_at),
           INTERVAL '1 hour'
         ) AS t(gs)
       ),
+      -- Calculate overlap with each hour
       overlap AS (
         SELECT
           cell_id, grid_lat, grid_lng, hour_ts,
           GREATEST(
             0,
+            (cell_duration_sec / NULLIF(EXTRACT(EPOCH FROM ended_at - started_at), 0)) *
             EXTRACT(EPOCH FROM LEAST(ended_at, hour_ts + INTERVAL '1 hour')
                           - GREATEST(started_at, hour_ts))
           ) AS overlap_sec
@@ -448,39 +558,69 @@ print("weather range:", con.execute("SELECT MIN(hour_ts), MAX(hour_ts) FROM weat
 # In[7]:
 
 
-grid_train_path = OUT_DIR / "grid_train_cell_hour_2020_2024.parquet"
+# Two separate grids:
+# 1. Daily grid for GLM training (memory-efficient: ~117K rows)
+# 2. Hourly grid for dashboard analysis (kept for hour-of-day patterns)
+grid_train_day_path = OUT_DIR / "grid_train_cell_day_2020_2024.parquet"  # For GLM
+grid_train_hour_path = OUT_DIR / "grid_train_cell_hour_2020_2024.parquet"  # For Dashboard
 cells_keep_path = OUT_DIR / "grid_cells_keep_2020_2024.parquet"
 
 if FORCE_REBUILD:
-    if grid_train_path.exists(): grid_train_path.unlink()
+    if grid_train_day_path.exists(): grid_train_day_path.unlink()
+    if grid_train_hour_path.exists(): grid_train_hour_path.unlink()
     if cells_keep_path.exists(): cells_keep_path.unlink()
 
-# 1) Determine top exposure cells covering CELL_COVERAGE of total exposure (TRAINING DATA ONLY)
+# 1) Determine cells covering CRASH_COVERAGE of total CRASHES (TRAINING DATA ONLY)
+# NOTE: We select by CRASH count, not exposure! This ensures we cover most crashes.
+# Exposure-based selection was problematic: 80% exposure = only 37% crashes
 con.execute(f"""
 COPY (
-  WITH cell_exp AS (
+  WITH cell_crashes AS (
+    -- Count crashes per cell in training period
+    SELECT
+      cell_id,
+      SUM(y_bike) AS crash_sum
+    FROM read_parquet('{crash_cell_hour_path.as_posix()}')
+    WHERE hour_ts >= TIMESTAMP '{TMIN}'
+      AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
+    GROUP BY 1
+  ),
+  cell_exp AS (
+    -- Also get exposure for reference
     SELECT
       cell_id,
       SUM(exposure_min) AS exp_sum
     FROM read_parquet('{exposure_train_path.as_posix()}')
-    WHERE hour_ts >= TIMESTAMP '2020-01-01'
-      AND hour_ts <  TIMESTAMP '2025-01-01'
+    WHERE hour_ts >= TIMESTAMP '{TMIN}'
+      AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
     GROUP BY 1
+  ),
+  merged AS (
+    -- Join crashes and exposure, keep only cells with exposure > 0
+    SELECT
+      COALESCE(c.cell_id, e.cell_id) AS cell_id,
+      COALESCE(c.crash_sum, 0) AS crash_sum,
+      COALESCE(e.exp_sum, 0) AS exp_sum
+    FROM cell_crashes c
+    FULL OUTER JOIN cell_exp e USING(cell_id)
+    WHERE e.exp_sum > 0  -- Must have some exposure to be in model
   ),
   ranked AS (
     SELECT
       cell_id,
+      crash_sum,
       exp_sum,
-      SUM(exp_sum) OVER (ORDER BY exp_sum DESC) AS cum_exp,
-      SUM(exp_sum) OVER () AS total_exp
-    FROM cell_exp
+      SUM(crash_sum) OVER (ORDER BY crash_sum DESC) AS cum_crash,
+      SUM(crash_sum) OVER () AS total_crash
+    FROM merged
   )
   SELECT
     cell_id,
+    crash_sum,
     exp_sum,
-    cum_exp / NULLIF(total_exp,0) AS cum_share
+    cum_crash / NULLIF(total_crash, 0) AS cum_share
   FROM ranked
-  WHERE cum_exp / NULLIF(total_exp,0) <= {CELL_COVERAGE}
+  WHERE cum_crash / NULLIF(total_crash, 0) <= {CRASH_COVERAGE}
 )
 TO '{cells_keep_path.as_posix()}'
 (FORMAT PARQUET);
@@ -488,52 +628,167 @@ TO '{cells_keep_path.as_posix()}'
 
 print("Wrote:", cells_keep_path)
 
-# 2) Build grid training mart: one row per (cell_id, hour_ts) - TRAINING DATA ONLY
+# ============================================================================
+# 2) Build DAILY grid for GLM training (memory-efficient: ~117K rows)
+# ============================================================================
+# Aggregates hourly data to daily level to reduce RAM usage from ~2.8M to ~117K rows
+# This is sufficient for GLM training since hour-of-day is not a critical feature
+print("\nBuilding DAILY training grid (cells × days CROSS JOIN)...")
+print("This creates ~117K rows (64 cells × 1826 days)...")
+
 con.execute(f"""
 COPY (
-  WITH e AS (
-    SELECT
-      hour_ts, cell_id, grid_lat, grid_lng, exposure_min
+  WITH cell_coords AS (
+    -- Get grid coordinates from exposure file (one row per cell)
+    SELECT DISTINCT cell_id, grid_lat, grid_lng
     FROM read_parquet('{exposure_train_path.as_posix()}')
-    WHERE hour_ts >= TIMESTAMP '2020-01-01'
-      AND hour_ts <  TIMESTAMP '2025-01-01'
-      AND exposure_min > 0
   ),
-  e_keep AS (
-    SELECT e.*
-    FROM e
-    INNER JOIN read_parquet('{cells_keep_path.as_posix()}') k USING(cell_id)
+  keep_cells AS (
+    -- List of cells to keep (top X% crashes)
+    SELECT cell_id
+    FROM read_parquet('{cells_keep_path.as_posix()}')
+  ),
+  all_days AS (
+    -- Generate all days in training period
+    SELECT DISTINCT date_trunc('day', hour_ts) AS day_ts
+    FROM weather_hourly
+    WHERE hour_ts >= TIMESTAMP '{TMIN}'
+      AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
+  ),
+  all_grid AS (
+    -- CROSS JOIN: every cell × every day in training period
+    SELECT
+      c.cell_id, c.grid_lat, c.grid_lng,
+      d.day_ts
+    FROM cell_coords c
+    INNER JOIN keep_cells k ON c.cell_id = k.cell_id
+    CROSS JOIN all_days d
+  ),
+  e_daily AS (
+    -- Aggregate exposure to daily level
+    SELECT
+      date_trunc('day', hour_ts) AS day_ts,
+      cell_id,
+      SUM(exposure_min) AS exposure_min
+    FROM read_parquet('{exposure_train_path.as_posix()}')
+    WHERE hour_ts >= TIMESTAMP '{TMIN}'
+      AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
+    GROUP BY 1, 2
+  ),
+  c_daily AS (
+    -- Aggregate crashes to daily level
+    SELECT
+      date_trunc('day', hour_ts) AS day_ts,
+      cell_id,
+      SUM(y_bike) AS y_bike
+    FROM read_parquet('{crash_cell_hour_path.as_posix()}')
+    WHERE hour_ts >= TIMESTAMP '{TMIN}'
+      AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
+    GROUP BY 1, 2
+  ),
+  w_daily AS (
+    -- Aggregate weather to daily level (AVG for temp/wspd, SUM for prcp/snow)
+    SELECT
+      date_trunc('day', hour_ts) AS day_ts,
+      AVG(temp) AS temp,
+      SUM(prcp) AS prcp,
+      SUM(snow) AS snow,
+      AVG(wspd) AS wspd
+    FROM weather_hourly
+    WHERE hour_ts >= TIMESTAMP '{TMIN}'
+      AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
+    GROUP BY 1
+  )
+  SELECT
+    g.day_ts,
+    g.cell_id,
+    g.grid_lat,
+    g.grid_lng,
+    COALESCE(e.exposure_min, 0) AS exposure_min,  -- 0 if no CitiBike trips
+    COALESCE(c.y_bike, 0) AS y_bike,              -- 0 if no crashes
+    EXTRACT(DOW   FROM g.day_ts) AS dow,
+    EXTRACT(MONTH FROM g.day_ts) AS month,
+    w.temp, w.prcp, w.snow, w.wspd
+  FROM all_grid g
+  LEFT JOIN e_daily e USING(day_ts, cell_id)
+  LEFT JOIN c_daily c USING(day_ts, cell_id)
+  LEFT JOIN w_daily w USING(day_ts)
+)
+TO '{grid_train_day_path.as_posix()}'
+(FORMAT PARQUET);
+""")
+
+print("Wrote:", grid_train_day_path)
+print(con.execute(f"""
+SELECT COUNT(*) n, AVG(y_bike) y_mean, AVG(exposure_min) exp_mean
+FROM read_parquet('{grid_train_day_path.as_posix()}');
+""").fetch_df())
+
+# ============================================================================
+# 3) Build HOURLY grid for Dashboard analysis (hour-of-day patterns)
+# ============================================================================
+# This file is NOT loaded into pandas during GLM training - only used by dashboard
+# Dashboard uses Streamlit's @st.cache_data which is separate from this script's RAM
+print("\nBuilding HOURLY training grid for Dashboard (cells × hours)...")
+print("This file will only be used by the dashboard, not loaded here...")
+
+con.execute(f"""
+COPY (
+  WITH cell_coords AS (
+    SELECT DISTINCT cell_id, grid_lat, grid_lng
+    FROM read_parquet('{exposure_train_path.as_posix()}')
+  ),
+  keep_cells AS (
+    SELECT cell_id
+    FROM read_parquet('{cells_keep_path.as_posix()}')
+  ),
+  all_grid AS (
+    SELECT
+      c.cell_id, c.grid_lat, c.grid_lng,
+      h.hour_ts
+    FROM cell_coords c
+    INNER JOIN keep_cells k ON c.cell_id = k.cell_id
+    CROSS JOIN (
+      SELECT DISTINCT hour_ts
+      FROM weather_hourly
+      WHERE hour_ts >= TIMESTAMP '{TMIN}'
+        AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
+    ) h
+  ),
+  e AS (
+    SELECT hour_ts, cell_id, exposure_min
+    FROM read_parquet('{exposure_train_path.as_posix()}')
+    WHERE hour_ts >= TIMESTAMP '{TMIN}'
+      AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
   ),
   c AS (
     SELECT hour_ts, cell_id, y_bike
     FROM read_parquet('{crash_cell_hour_path.as_posix()}')
-    WHERE hour_ts >= TIMESTAMP '2020-01-01'
-      AND hour_ts <  TIMESTAMP '2025-01-01'
+    WHERE hour_ts >= TIMESTAMP '{TMIN}'
+      AND hour_ts <  TIMESTAMP '{TMAX_TRAIN}'
   )
   SELECT
-    e_keep.hour_ts,
-    e_keep.cell_id,
-    e_keep.grid_lat,
-    e_keep.grid_lng,
-    e_keep.exposure_min,
+    g.hour_ts,
+    g.cell_id,
+    g.grid_lat,
+    g.grid_lng,
+    COALESCE(e.exposure_min, 0) AS exposure_min,
     COALESCE(c.y_bike, 0) AS y_bike,
-    EXTRACT(HOUR  FROM e_keep.hour_ts) AS hour_of_day,
-    EXTRACT(DOW   FROM e_keep.hour_ts) AS dow,
-    EXTRACT(MONTH FROM e_keep.hour_ts) AS month,
+    EXTRACT(HOUR  FROM g.hour_ts) AS hour_of_day,
+    EXTRACT(DOW   FROM g.hour_ts) AS dow,
+    EXTRACT(MONTH FROM g.hour_ts) AS month,
     w.temp, w.prcp, w.snow, w.wspd
-  FROM e_keep
+  FROM all_grid g
+  LEFT JOIN e USING(hour_ts, cell_id)
   LEFT JOIN c USING(hour_ts, cell_id)
   LEFT JOIN weather_hourly w USING(hour_ts)
 )
-TO '{grid_train_path.as_posix()}'
+TO '{grid_train_hour_path.as_posix()}'
 (FORMAT PARQUET);
 """)
 
-print("Wrote:", grid_train_path)
-print(con.execute(f"""
-SELECT COUNT(*) n, AVG(y_bike) y_mean, AVG(exposure_min) exp_mean
-FROM read_parquet('{grid_train_path.as_posix()}');
-""").fetch_df())
+print("Wrote:", grid_train_hour_path)
+# NOTE: We do NOT load this into pandas to save RAM - dashboard will load it separately
 
 
 # In[16]:
@@ -543,42 +798,29 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 
 TARGET = "y_bike"
-MIN_EXPOSURE_MIN = 50.0
-EPS = 1e-6
+# NOTE: No MIN_EXPOSURE_MIN filter - we include ALL observations
+# Exposure=0 is valid and handled via log1p transformation
 weather_cols = ["temp","prcp","snow","wspd"]
 
-# Load (grid train) to pandas
-train_df = con.execute(f"SELECT * FROM read_parquet('{grid_train_path.as_posix()}')").fetch_df()
+# ============================================================================
+# Load DAILY grid for GLM training (memory-efficient: ~117K rows instead of ~2.8M)
+# ============================================================================
+print("\nLoading DAILY training grid for GLM...")
+train_df = con.execute(f"SELECT * FROM read_parquet('{grid_train_day_path.as_posix()}')").fetch_df()
+print(f"Loaded {len(train_df):,} rows (daily aggregation)")
 
-# clean
-need = ["exposure_min", TARGET, "hour_of_day","dow","month","grid_lat","grid_lng"] + weather_cols
+# clean - only drop rows with missing required features
+# NOTE: No hour_of_day in daily data - removed from formula
+need = ["exposure_min", TARGET, "dow", "month", "grid_lat", "grid_lng"] + weather_cols
 train_df = train_df.dropna(subset=need).copy()
-train_df = train_df[train_df["exposure_min"] >= MIN_EXPOSURE_MIN].copy()
 
-# offset
-train_df["log_exposure"] = np.log(train_df["exposure_min"].values + EPS)
+# EXPOSURE AS FEATURE (not offset!)
+# log1p handles exposure=0 gracefully: log(0+1) = 0
+train_df["log1p_exposure"] = np.log1p(train_df["exposure_min"].values)
 
-# categories
-train_df["hour_of_day"] = train_df["hour_of_day"].astype(int).astype("category")
+# categories (no hour_of_day in daily data)
 train_df["dow"] = train_df["dow"].astype(int).astype("category")
 train_df["month"] = train_df["month"].astype(int).astype("category")
-
-# ============================================================================
-# TREND FEATURE: Capture long-term changes in crash rate
-# ============================================================================
-# The crash rate has been declining over time (1.58 in 2020 → 1.01 in 2024).
-# Without a trend term, the model learns the average rate and over-predicts.
-# We use a linear trend: trend = year - 2020 (so 2020=0, 2021=1, ..., 2025=5)
-# This allows extrapolation to 2025 with a single parameter.
-# ============================================================================
-train_df["hour_ts"] = pd.to_datetime(train_df["hour_ts"])
-train_df["year"] = train_df["hour_ts"].dt.year
-TREND_BASE_YEAR = 2020
-train_df["trend"] = train_df["year"] - TREND_BASE_YEAR
-
-print(f"\nTrend feature added: trend = year - {TREND_BASE_YEAR}")
-print(f"Training years: {sorted(train_df['year'].unique())}")
-print(f"Trend values: {sorted(train_df['trend'].unique())}")
 
 # CRITICAL: Compute normalization statistics from TRAINING DATA ONLY (2020-2024)
 # These statistics will be applied to test data (2025) to prevent data leakage
@@ -610,23 +852,35 @@ train_df["lat2"] = train_df["grid_lat_norm"]**2
 train_df["lng2"] = train_df["grid_lng_norm"]**2
 train_df["lat_lng"] = train_df["grid_lat_norm"] * train_df["grid_lng_norm"]
 
-# model formula (GRID MODEL) - use normalized versions
-# NOTE: "trend" is included to capture long-term decline in crash rate
+# TREND VARIABLE: Captures temporal changes in crash rates
+# Normalized to years since start of training period
+# NOTE: Using day_ts instead of hour_ts for daily data
+TREND_BASE_DATE = pd.Timestamp(TMIN)  # Uses TMIN constant (2021-01-01)
+train_df["trend"] = (train_df["day_ts"] - TREND_BASE_DATE).dt.days / 365.25
+
+# ============================================================================
+# DAILY MODEL FORMULA (no hour_of_day - aggregated to daily level)
+# ============================================================================
+# Removed C(hour_of_day) because we aggregate to daily level for memory efficiency
+# This reduces training rows from ~2.8M to ~117K
 rhs = [
-    "C(hour_of_day)", "C(dow)", "C(month)",
+    "C(dow)", "C(month)",  # NOTE: No hour_of_day in daily model
     "grid_lat_norm", "grid_lng_norm", "lat2", "lng2", "lat_lng",
-    "trend"  # Linear trend term: captures year-over-year rate changes
+    "trend",  # Captures temporal changes - improves predictions significantly
+    "log1p_exposure",  # FEATURE, not offset!
 ] + active_weather_cols
 
 formula = f"{TARGET} ~ " + " + ".join(rhs)
 print("Formula:", formula)
+print("\nNOTE: Daily aggregation - no hour_of_day feature (saves ~24x RAM)")
+print("NOTE: Exposure is a FEATURE with estimated coefficient (not offset with β=1)")
 
 # ---- Poisson GLM ----
+# NOTE: No offset - exposure is a feature in the formula
 poisson_model = smf.glm(
     formula=formula,
     data=train_df,
-    family=sm.families.Poisson(),
-    offset=train_df["log_exposure"]
+    family=sm.families.Poisson()
 )
 poisson_res = poisson_model.fit(cov_type="HC0")
 print("\n=== POISSON (grid model) ===")
@@ -636,36 +890,11 @@ pearson_chi2 = float(np.sum(poisson_res.resid_pearson**2))
 disp_poiss = pearson_chi2 / float(poisson_res.df_resid)
 print("\nPoisson overdispersion χ²/df:", disp_poiss)
 
-# ---- Negative Binomial GLM (PROPER MLE ESTIMATION) ----
-print("\n" + "="*70)
-print("FITTING NEGATIVE BINOMIAL WITH MLE ALPHA ESTIMATION")
-print("="*70)
-
-# Use NegativeBinomial family WITHOUT specifying alpha
-# statsmodels will estimate it via MLE during fitting
-nb_model = smf.glm(
-    formula=formula,
-    data=train_df,
-    family=sm.families.NegativeBinomial(),  # No alpha specified!
-    offset=train_df["log_exposure"]
-)
-
-# Fit with scale='X2' to get proper dispersion parameter
-nb_res = nb_model.fit(cov_type="HC0", scale='X2')
-
-print("\n=== NEG BIN (grid model, MLE alpha) ===")
-print(nb_res.summary())
-print("\nNB alpha (MLE): {:.6f}".format(float(nb_res.scale)))
-print("NB dispersion (χ²/df): {:.6f}".format(
-    float(np.sum(nb_res.resid_pearson**2) / nb_res.df_resid)
-))
-
-# Store the estimated alpha for later use
-alpha_mle = float(nb_res.scale)
+# NOTE: Negative Binomial removed - Poisson dispersion ~1 indicates no overdispersion
 
 meta = {
     "GRID_DEG": GRID_DEG,
-    "CELL_COVERAGE": CELL_COVERAGE,
+    "CRASH_COVERAGE": CRASH_COVERAGE,
     "weather_stats": {k: {"mean": v[0], "std": v[1]} for k,v in weather_stats.items()},
     "spatial_stats": {
         "lat_mean": float(lat_mean),
@@ -673,10 +902,12 @@ meta = {
         "lng_mean": float(lng_mean),
         "lng_std": float(lng_std)
     },
-    "trend_base_year": TREND_BASE_YEAR,  # For computing trend = year - base_year
+    "trend_included": True,
+    "trend_base_date": TMIN,  # Uses TMIN constant
+    "exposure_as_feature": True,  # Exposure is a feature, not offset
+    "exposure_coefficient": float(poisson_res.params.get("log1p_exposure", 0)),
     "formula": formula,
-    "active_weather_cols": active_weather_cols,
-    "alpha_mle": alpha_mle  # Save MLE alpha for reproducibility
+    "active_weather_cols": active_weather_cols
 }
 meta_path = OUT_DIR / "model_meta_bike_all.json"
 meta_path.write_text(json.dumps(meta, indent=2))
@@ -686,119 +917,282 @@ print("\nSaved:", meta_path)
 # In[18]:
 
 
-grid_2025_path = OUT_DIR / "grid_2025_cell_hour_bike_all.parquet"
+# ============================================================================
+# Build DAILY 2025 grid for Monte Carlo predictions (memory-efficient)
+# ============================================================================
+# IMPORTANT: Only include cells that had ACTUAL 2025 exposure!
+# This ensures prediction and observed use the same cell set.
+# Previously we used training cells (cells_keep), but some training cells
+# may not have 2025 exposure, leading to inflated predictions.
+grid_2025_day_path = OUT_DIR / "grid_2025_cell_day_bike_all.parquet"
+cells_2025_path = OUT_DIR / "grid_cells_2025.parquet"  # Cells with 2025 exposure
 
-if FORCE_REBUILD and grid_2025_path.exists():
-    grid_2025_path.unlink()
+if FORCE_REBUILD and grid_2025_day_path.exists():
+    grid_2025_day_path.unlink()
+if FORCE_REBUILD and cells_2025_path.exists():
+    cells_2025_path.unlink()
 
+# First: Identify cells that had ANY exposure in 2025
+# These must ALSO be in cells_keep (training cells) to have model coefficients
+print("\nIdentifying cells with 2025 exposure (intersection with training cells)...")
 con.execute(f"""
 COPY (
-  WITH e AS (
-    SELECT
-      hour_ts, cell_id, grid_lat, grid_lng, exposure_min
-    FROM read_parquet('{exposure_test_path.as_posix()}')
-    WHERE hour_ts >= TIMESTAMP '2025-01-01'
-      AND hour_ts <  TIMESTAMP '2026-01-01'
-      AND exposure_min > 0
-  ),
-  e_keep AS (
-    SELECT e.*
-    FROM e
-    INNER JOIN read_parquet('{cells_keep_path.as_posix()}') k USING(cell_id)
-  )
-  SELECT
-    e_keep.hour_ts,
-    e_keep.cell_id,
-    e_keep.grid_lat,
-    e_keep.grid_lng,
-    e_keep.exposure_min,
-    EXTRACT(HOUR  FROM e_keep.hour_ts) AS hour_of_day,
-    EXTRACT(DOW   FROM e_keep.hour_ts) AS dow,
-    EXTRACT(MONTH FROM e_keep.hour_ts) AS month,
-    w.temp, w.prcp, w.snow, w.wspd
-  FROM e_keep
-  LEFT JOIN weather_hourly w USING(hour_ts)
-  ORDER BY hour_ts, cell_id
+  SELECT DISTINCT e.cell_id
+  FROM read_parquet('{exposure_test_path.as_posix()}') e
+  INNER JOIN read_parquet('{cells_keep_path.as_posix()}') k USING(cell_id)
+  WHERE e.hour_ts >= TIMESTAMP '2025-01-01'
+    AND e.hour_ts <  TIMESTAMP '2026-01-01'
+    AND e.exposure_min > 0
 )
-TO '{grid_2025_path.as_posix()}'
+TO '{cells_2025_path.as_posix()}'
 (FORMAT PARQUET);
 """)
 
-print("Wrote:", grid_2025_path)
-print(con.execute(f"SELECT COUNT(*) n FROM read_parquet('{grid_2025_path.as_posix()}')").fetch_df())
+n_cells_2025 = con.execute(f"SELECT COUNT(*) FROM read_parquet('{cells_2025_path.as_posix()}')").fetchone()[0]
+n_cells_train = con.execute(f"SELECT COUNT(*) FROM read_parquet('{cells_keep_path.as_posix()}')").fetchone()[0]
+print(f"Training cells (2020-2024): {n_cells_train}")
+print(f"Cells with 2025 exposure:   {n_cells_2025}")
+print(f"Coverage: {n_cells_2025/n_cells_train*100:.1f}% of training cells active in 2025")
+
+print("\nBuilding DAILY 2025 grid (only cells with 2025 exposure)...")
+
+con.execute(f"""
+COPY (
+  WITH cell_coords AS (
+    -- Get coordinates from training exposure (has grid_lat, grid_lng)
+    SELECT DISTINCT cell_id, grid_lat, grid_lng
+    FROM read_parquet('{exposure_train_path.as_posix()}')
+  ),
+  cells_2025 AS (
+    -- Only cells that had 2025 exposure AND are in training set
+    SELECT cell_id
+    FROM read_parquet('{cells_2025_path.as_posix()}')
+  ),
+  all_days AS (
+    -- Generate all days in 2025
+    SELECT DISTINCT date_trunc('day', hour_ts) AS day_ts
+    FROM weather_hourly
+    WHERE hour_ts >= TIMESTAMP '2025-01-01'
+      AND hour_ts <  TIMESTAMP '2026-01-01'
+  ),
+  all_grid AS (
+    -- CROSS JOIN: only 2025-active cells × every day in 2025
+    SELECT
+      c.cell_id, c.grid_lat, c.grid_lng,
+      d.day_ts
+    FROM cell_coords c
+    INNER JOIN cells_2025 k ON c.cell_id = k.cell_id
+    CROSS JOIN all_days d
+  ),
+  e_daily AS (
+    -- Aggregate exposure to daily level
+    SELECT
+      date_trunc('day', hour_ts) AS day_ts,
+      cell_id,
+      SUM(exposure_min) AS exposure_min
+    FROM read_parquet('{exposure_test_path.as_posix()}')
+    WHERE hour_ts >= TIMESTAMP '2025-01-01'
+      AND hour_ts <  TIMESTAMP '2026-01-01'
+    GROUP BY 1, 2
+  ),
+  w_daily AS (
+    -- Aggregate weather to daily level (same as training)
+    SELECT
+      date_trunc('day', hour_ts) AS day_ts,
+      AVG(temp) AS temp,
+      SUM(prcp) AS prcp,
+      SUM(snow) AS snow,
+      AVG(wspd) AS wspd
+    FROM weather_hourly
+    WHERE hour_ts >= TIMESTAMP '2025-01-01'
+      AND hour_ts <  TIMESTAMP '2026-01-01'
+    GROUP BY 1
+  )
+  SELECT
+    g.day_ts,
+    g.cell_id,
+    g.grid_lat,
+    g.grid_lng,
+    COALESCE(e.exposure_min, 0) AS exposure_min,
+    EXTRACT(DOW   FROM g.day_ts) AS dow,
+    EXTRACT(MONTH FROM g.day_ts) AS month,
+    w.temp, w.prcp, w.snow, w.wspd
+  FROM all_grid g
+  LEFT JOIN e_daily e USING(day_ts, cell_id)
+  LEFT JOIN w_daily w USING(day_ts)
+  ORDER BY g.day_ts, g.cell_id
+)
+TO '{grid_2025_day_path.as_posix()}'
+(FORMAT PARQUET);
+""")
+
+print("Wrote:", grid_2025_day_path)
+print(con.execute(f"SELECT COUNT(*) n FROM read_parquet('{grid_2025_day_path.as_posix()}')").fetch_df())
 
 
 # In[ ]:
 
 
 import patsy
+import gc  # For explicit garbage collection to save RAM
 from numpy.random import default_rng
 
 rng = default_rng(42)
-S = 50  # Monte Carlo simulations (reduced for speed; increase for production)
+S = 30  # Monte Carlo simulations (reduced from 50 for RAM; still sufficient for CI)
 
 # ============================================================================
-# STEP 1: Load Weather for ALL Years (by day-of-year + hour)
+# STEP 1: Load Weather for ALL Years (by day-of-year) - DAILY AGGREGATION
 # ============================================================================
 print("="*70)
-print("PREPARING YEAR-LEVEL WEATHER BOOTSTRAP (day-of-year mapping)")
+print("PREPARING YEAR-LEVEL WEATHER BOOTSTRAP (day-of-year mapping - DAILY)")
 print("="*70)
 
-# Load training weather
-train_weather = con.execute(f"SELECT * FROM read_parquet('{grid_train_path.as_posix()}')").fetch_df()
-train_weather["hour_ts"] = pd.to_datetime(train_weather["hour_ts"])
-train_weather["year"] = train_weather["hour_ts"].dt.year
-train_weather["dayofyear"] = train_weather["hour_ts"].dt.dayofyear
-train_weather["hour"] = train_weather["hour_ts"].dt.hour
+# Load training weather from DAILY grid (already aggregated)
+train_weather = con.execute(f"SELECT * FROM read_parquet('{grid_train_day_path.as_posix()}')").fetch_df()
+train_weather["day_ts"] = pd.to_datetime(train_weather["day_ts"])
+train_weather["year"] = train_weather["day_ts"].dt.year
+train_weather["dayofyear"] = train_weather["day_ts"].dt.dayofyear
 
 weather_cols = ["temp", "prcp", "snow", "wspd"]
-available_years = [2020, 2021, 2022, 2023, 2024]
+available_weather_years = [2021, 2022, 2023, 2024]  # Training years for weather (excludes COVID 2020)
 
-# Build lookup: year → (dayofyear, hour) → weather
+# Build lookup: year → dayofyear → weather (DAILY, no hour dimension)
 year_weather_dict = {}
 
-for year in available_years:
+for year in available_weather_years:
     year_data = train_weather[train_weather['year'] == year].copy()
 
-    # Aggregate to (dayofyear, hour) - take median if multiple observations
-    year_agg = year_data.groupby(['dayofyear', 'hour'])[weather_cols].median().reset_index()
+    # Aggregate to dayofyear - take median if multiple observations (across cells)
+    year_agg = year_data.groupby(['dayofyear'])[weather_cols].median().reset_index()
 
-    # Convert to dict
+    # Convert to dict (key is just dayofyear, not (dayofyear, hour))
     year_dict = {}
     for _, row in year_agg.iterrows():
-        key = (int(row['dayofyear']), int(row['hour']))
+        key = int(row['dayofyear'])
         year_dict[key] = {col: row[col] for col in weather_cols}
 
     year_weather_dict[year] = year_dict
-    print(f"  Year {year}: {len(year_dict)} unique (dayofyear, hour) combinations")
+    print(f"  Year {year}: {len(year_dict)} unique days")
+
+# Also add 2025 weather from the 2025 grid
+print("\nAdding 2025 weather...")
+weather_2025 = con.execute(f"""
+SELECT
+    EXTRACT(dayofyear FROM day_ts)::INT AS dayofyear,
+    AVG(temp) AS temp,
+    AVG(prcp) AS prcp,
+    AVG(snow) AS snow,
+    AVG(wspd) AS wspd
+FROM read_parquet('{grid_2025_day_path.as_posix()}')
+GROUP BY EXTRACT(dayofyear FROM day_ts)
+""").fetch_df()
+
+year_dict_2025 = {}
+for _, row in weather_2025.iterrows():
+    key = int(row['dayofyear'])
+    year_dict_2025[key] = {col: row[col] for col in weather_cols}
+year_weather_dict[2025] = year_dict_2025
+print(f"  Year 2025: {len(year_dict_2025)} unique days")
+
+# Update available years to include 2025 (still excludes 2020)
+available_weather_years = [2021, 2022, 2023, 2024, 2025]
 
 # Check coverage
-test_key = (15, 14)  # 15th day of year, 14:00
-print(f"\nDay 15, hour 14 across years:")
-for year in available_years:
+test_key = 15  # 15th day of year
+print(f"\nDay 15 across years:")
+for year in available_weather_years:
     if test_key in year_weather_dict[year]:
         w = year_weather_dict[year][test_key]
         print(f"  {year}: temp={w['temp']:+.1f}°C, prcp={w['prcp']:.1f}mm")
 
-# ============================================================================
-# STEP 2: Prepare 2025 Data
-# ============================================================================
-df2025 = con.execute(f"SELECT * FROM read_parquet('{grid_2025_path.as_posix()}')").fetch_df()
-df2025 = df2025.dropna(subset=["exposure_min","hour_of_day","dow","month","grid_lat","grid_lng"]).copy()
-df2025 = df2025[df2025["exposure_min"] > 0].copy()
+# Free memory from train_weather
+del train_weather
+gc.collect()
 
-df2025["hour_ts"] = pd.to_datetime(df2025["hour_ts"])
-df2025["dayofyear"] = df2025["hour_ts"].dt.dayofyear.astype(int)
-df2025["hour"] = df2025["hour_ts"].dt.hour.astype(int)
+# ============================================================================
+# STEP 1b: Extract Daily Exposure for ALL Years (2020-2025)
+# ============================================================================
+# This enables comprehensive uncertainty simulation with different exposure scenarios
+print("\n" + "="*70)
+print("EXTRACTING EXPOSURE FOR ALL YEARS (2020-2025)")
+print("="*70)
 
-df2025["hour_of_day"] = df2025["hour_of_day"].astype(int).astype("category")
+# Extract 2020-2024 from training data
+exposure_train_years = con.execute(f"""
+SELECT
+    cell_id,
+    EXTRACT(year FROM hour_ts)::INT AS year,
+    EXTRACT(dayofyear FROM hour_ts)::INT AS dayofyear,
+    SUM(exposure_min) AS exposure_min
+FROM read_parquet('{exposure_train_path.as_posix()}')
+GROUP BY cell_id, EXTRACT(year FROM hour_ts), EXTRACT(dayofyear FROM hour_ts)
+""").fetch_df()
+
+# Extract 2025 from test data
+exposure_2025_df = con.execute(f"""
+SELECT
+    cell_id,
+    2025 AS year,
+    EXTRACT(dayofyear FROM hour_ts)::INT AS dayofyear,
+    SUM(exposure_min) AS exposure_min
+FROM read_parquet('{exposure_test_path.as_posix()}')
+WHERE hour_ts >= TIMESTAMP '2025-01-01'
+  AND hour_ts <  TIMESTAMP '2026-01-01'
+GROUP BY cell_id, EXTRACT(dayofyear FROM hour_ts)
+""").fetch_df()
+
+# Build nested lookup dict: year -> (cell_id, dayofyear) -> exposure
+exposure_by_year = {}
+available_exposure_years = [2021, 2022, 2023, 2024, 2025]  # Excludes COVID 2020
+
+# Add 2021-2024 (excludes 2020)
+for year in [2021, 2022, 2023, 2024]:
+    year_data = exposure_train_years[exposure_train_years['year'] == year]
+    year_lookup = {}
+    for _, row in year_data.iterrows():
+        key = (row['cell_id'], int(row['dayofyear']))
+        year_lookup[key] = row['exposure_min']
+    exposure_by_year[year] = year_lookup
+    print(f"  {year}: {len(year_lookup):,} cell-day combinations")
+
+# Add 2025
+year_lookup_2025 = {}
+for _, row in exposure_2025_df.iterrows():
+    key = (row['cell_id'], int(row['dayofyear']))
+    year_lookup_2025[key] = row['exposure_min']
+exposure_by_year[2025] = year_lookup_2025
+print(f"  2025: {len(year_lookup_2025):,} cell-day combinations")
+
+# Free memory
+del exposure_train_years, exposure_2025_df
+gc.collect()
+
+# ============================================================================
+# STEP 2: Prepare 2025 DAILY Data
+# ============================================================================
+print("\nLoading DAILY 2025 grid for Monte Carlo...")
+df2025 = con.execute(f"SELECT * FROM read_parquet('{grid_2025_day_path.as_posix()}')").fetch_df()
+df2025 = df2025.dropna(subset=["exposure_min", "dow", "month", "grid_lat", "grid_lng"]).copy()
+# NOTE: No exposure_min > 0 filter - we include ALL observations
+# Exposure=0 is valid and handled via log1p transformation
+
+df2025["day_ts"] = pd.to_datetime(df2025["day_ts"])
+df2025["dayofyear"] = df2025["day_ts"].dt.dayofyear.astype(int)
+
+# Categories (no hour_of_day in daily data)
 df2025["dow"] = df2025["dow"].astype(int).astype("category")
 df2025["month"] = df2025["month"].astype(int).astype("category")
 
-# Add trend feature for 2025 (year=2025, so trend = 2025 - 2020 = 5)
-df2025["year"] = df2025["hour_ts"].dt.year
-df2025["trend"] = df2025["year"] - TREND_BASE_YEAR
-print(f"2025 trend value: {df2025['trend'].iloc[0]} (year {df2025['year'].iloc[0]} - {TREND_BASE_YEAR})")
+# Add trend variable for 2025 (same base date as training)
+# Note: TREND_BASE_DATE already defined earlier using TMIN
+df2025["trend"] = (df2025["day_ts"] - TREND_BASE_DATE).dt.days / 365.25
+
+# EXPOSURE AS FEATURE (not offset!) - same as training
+df2025["log1p_exposure"] = np.log1p(df2025["exposure_min"].values)
+
+print(f"2025 data prepared: {len(df2025):,} rows (DAILY aggregation)")
+print(f"Trend range: {df2025['trend'].min():.2f} to {df2025['trend'].max():.2f} years")
+print(f"log1p_exposure range: {df2025['log1p_exposure'].min():.2f} to {df2025['log1p_exposure'].max():.2f}")
 
 if meta_path.exists():
     meta = json.loads(meta_path.read_text())
@@ -807,63 +1201,91 @@ if meta_path.exists():
 else:
     raise ValueError("meta_path not found!")
 
-print(f"\nPrepared 2025 data: {len(df2025)} rows")
+print(f"\nPrepared 2025 data: {len(df2025):,} rows")
 
-# Pre-extract keys
-df2025_keys = list(zip(df2025['dayofyear'], df2025['hour']))
+# Pre-extract keys for fast lookup: (cell_id, dayofyear) pairs
+df2025_keys = df2025['dayofyear'].values
+df2025_cell_ids = df2025['cell_id'].values
+df2025_cell_day_keys = list(zip(df2025_cell_ids, df2025_keys))
 
 # ============================================================================
-# STEP 3: Simulation with Day-of-Year Weather Mapping + Exposure Scenarios
+# STEP 3: FULLY RANDOM Monte Carlo Simulation
 # ============================================================================
-def simulate_totals_year_weather(res, use_nb: bool, exposure_multiplier: float = 1.0):
+# For EACH simulation, randomly sample:
+# - Weather year (2021-2025) - excludes COVID 2020
+# - Exposure year (2021-2025) - excludes COVID 2020
+# - Growth factor: Uniform(0.85, 1.15) - continuous sampling
+# - Parameters (from covariance matrix)
+# ============================================================================
+
+# ============================================================================
+# EXPOSURE SCENARIO INTERPRETATION:
+# When exposure_year != 2025, we apply historical usage patterns to the 2025 network.
+# This answers: "What if the 2025 network had been used like in year X?"
+# This is NOT a reconstruction of actual historical crash totals.
+# Cells that didn't exist in year X will have exposure=0 (contributes minimally).
+# ============================================================================
+
+print("\n" + "="*70)
+print("RUNNING MONTE CARLO SIMULATION (POISSON)")
+print("="*70)
+print("Each simulation randomly samples:")
+print("  - Weather year:  2021-2025 (excludes COVID 2020)")
+print("  - Exposure year: 2021-2025 (excludes COVID 2020)")
+print("  - Growth factor: Uniform(0.80, 1.20)")
+print("  - Parameters:    from covariance matrix")
+print("="*70)
+
+# Configuration
+S = 1000  # Many simulations for smooth distribution
+GROWTH_MIN = 0.80  # -20% (historically observed)
+GROWTH_MAX = 1.20  # +20% (historically observed)
+
+def run_random_simulation(res, use_nb: bool, model_name: str):
     """
-    For each simulation: Pick ONE year and map 2025 dates to that year's weather
-
-    Args:
-        res: Model fit result (poisson or negbin)
-        use_nb: If True, use Negative Binomial; else Poisson
-        exposure_multiplier: Multiplier for 2025 exposure (e.g., 0.9, 1.0, 1.1)
-
-    NOTE: This weather bootstrapping approach preserves temporal correlation within
-    years but samples across years to capture inter-annual variability. While this
-    produces narrower confidence intervals than fully independent sampling, it is
-    more realistic as weather patterns are temporally autocorrelated.
+    Run S simulations with ALL dimensions randomly sampled per simulation.
     """
     design_info = res.model.data.design_info
 
-    # CRITICAL FIX: Use MLE alpha from model fit, not heuristic
     if use_nb:
-        # Get alpha from the fitted model's scale parameter
         alpha_nb = float(res.scale)
-        print(f"  Using NegBin alpha (MLE): {alpha_nb:.6f}, Exposure multiplier: {exposure_multiplier:.2f}")
+        print(f"\n  {model_name} (alpha={alpha_nb:.6f})")
     else:
         alpha_nb = 0.0
-        print(f"  Exposure multiplier: {exposure_multiplier:.2f}")
+        print(f"\n  {model_name}")
 
-    totals = np.zeros(S, dtype=np.int64)
+    results = []
 
     for s in range(S):
         if s % 50 == 0:
-            print(f"  Simulation {s}/{S}...")
+            print(f"    Simulation {s}/{S}...")
 
-        # ----------------------------------------------------------------
-        # A) Pick ONE year's weather
-        # ----------------------------------------------------------------
-        sampled_year = rng.choice(available_years)
-        year_weather = year_weather_dict[sampled_year]
+        # ================================================================
+        # A) RANDOM: Sample weather year (2021-2025)
+        # ================================================================
+        weather_year = int(rng.choice(available_weather_years))
+        year_weather = year_weather_dict[weather_year]
 
-        # ----------------------------------------------------------------
-        # B) Map 2025 (dayofyear, hour) → sampled year weather
-        # ----------------------------------------------------------------
+        # ================================================================
+        # B) RANDOM: Sample exposure year (2021-2025)
+        # ================================================================
+        exposure_year = int(rng.choice(available_exposure_years))
+
+        # ================================================================
+        # C) RANDOM: Sample growth factor from continuous uniform distribution
+        # ================================================================
+        growth_factor = float(rng.uniform(GROWTH_MIN, GROWTH_MAX))
+
+        # ================================================================
+        # D) Apply weather from sampled year
+        # ================================================================
         weather_matrix = np.zeros((len(df2025), 4))
-
         for i, key in enumerate(df2025_keys):
-            if key in year_weather:
-                w = year_weather[key]
+            weather_key = min(key, 365)  # Handle leap year
+            if weather_key in year_weather:
+                w = year_weather[weather_key]
                 weather_matrix[i] = [w['temp'], w['prcp'], w['snow'], w['wspd']]
-            # else: keep 0 (missing weather)
 
-        # Apply to df_sim
         df_sim = df2025.copy()
         df_sim['temp'] = weather_matrix[:, 0]
         df_sim['prcp'] = weather_matrix[:, 1]
@@ -882,9 +1304,25 @@ def simulate_totals_year_weather(res, use_nb: bool, exposure_multiplier: float =
         df_sim["lng2"] = df_sim["grid_lng_norm"]**2
         df_sim["lat_lng"] = df_sim["grid_lat_norm"] * df_sim["grid_lng_norm"]
 
-        # ----------------------------------------------------------------
-        # C) Sample β
-        # ----------------------------------------------------------------
+        # ================================================================
+        # E) Apply exposure from sampled year with growth factor
+        # ================================================================
+        if exposure_year == 2025:
+            exposure_values = df_sim["exposure_min"].values.copy()
+        else:
+            exposure_values = np.zeros(len(df2025))
+            year_exposure_lookup = exposure_by_year.get(exposure_year, {})
+            for i, (cell_id, doy) in enumerate(df2025_cell_day_keys):
+                lookup_doy = min(doy, 365)
+                exposure_values[i] = year_exposure_lookup.get((cell_id, lookup_doy), 0.0)
+
+        # Apply growth factor
+        scenario_exposure = exposure_values * growth_factor
+        df_sim["log1p_exposure"] = np.log1p(scenario_exposure)
+
+        # ================================================================
+        # F) Sample β from parameter distribution
+        # ================================================================
         X = patsy.build_design_matrices([design_info], df_sim, return_type="dataframe")[0]
         xcols = X.columns.tolist()
 
@@ -892,15 +1330,12 @@ def simulate_totals_year_weather(res, use_nb: bool, exposure_multiplier: float =
         cov_hat = res.cov_params().loc[xcols, xcols].values
         beta_s = rng.multivariate_normal(mean=beta_hat, cov=cov_hat)
 
-        # ----------------------------------------------------------------
-        # D) Calculate μ and Sample Crashes (with exposure scenario)
-        # ----------------------------------------------------------------
-        df_aligned = df_sim.loc[X.index]
-        E = df_aligned["exposure_min"].values * exposure_multiplier  # Apply exposure scenario
-
+        # ================================================================
+        # G) Calculate μ and sample crashes
+        # ================================================================
         eta = X.values @ beta_s
         eta = np.clip(eta, -20, 20)
-        mu = E * np.exp(eta)
+        mu = np.exp(eta)
         mu = np.clip(mu, 0, 1e6)
 
         if use_nb and alpha_nb > 0:
@@ -911,111 +1346,88 @@ def simulate_totals_year_weather(res, use_nb: bool, exposure_multiplier: float =
         else:
             y = rng.poisson(mu)
 
-        totals[s] = int(y.sum())
+        total = int(y.sum())
 
-    return totals
-
-# ============================================================================
-# STEP 4: Run Simulations with Exposure Scenarios
-# ============================================================================
-print("\n" + "="*70)
-print("RUNNING YEAR-LEVEL WEATHER BOOTSTRAP WITH EXPOSURE SCENARIOS")
-print("="*70)
-
-# Exposure scenarios: -10%, actual (0%), +10%
-exposure_scenarios = [0.9, 1.0, 1.1]
-scenario_labels = ["-10%", "actual", "+10%"]
-
-# Store all results
-all_results = []
-
-for exp_mult, exp_label in zip(exposure_scenarios, scenario_labels):
-    print(f"\n{'='*70}")
-    print(f"EXPOSURE SCENARIO: {exp_label} (multiplier = {exp_mult:.2f})")
-    print(f"{'='*70}")
-
-    print("\nModel: Poisson")
-    tot_p = simulate_totals_year_weather(poisson_res, use_nb=False, exposure_multiplier=exp_mult)
-
-    print("\nModel: Negative Binomial (MLE alpha)")
-    tot_n = simulate_totals_year_weather(nb_res, use_nb=True, exposure_multiplier=exp_mult)
-
-    def summarize(arr):
-        q05, q50, q95 = np.quantile(arr, [0.05, 0.5, 0.95])
-        return float(q05), float(q50), float(q95)
-
-    p05, p50, p95 = summarize(tot_p)
-    n05, n50, n95 = summarize(tot_n)
-
-    print("\n" + "="*70)
-    print(f"RESULTS FOR EXPOSURE {exp_label}")
-    print("="*70)
-    print(f"Poisson: 5th = {p05:.0f}, Median = {p50:.0f}, 95th = {p95:.0f}")
-    print(f"NegBin:  5th = {n05:.0f}, Median = {n50:.0f}, 95th = {n95:.0f}")
-    print(f"\nPoisson 90% CI: [{p05:.0f}, {p95:.0f}], width = {p95-p05:.0f} ({(p95-p05)/p50*100:.1f}%)")
-    print(f"NegBin  90% CI: [{n05:.0f}, {n95:.0f}], width = {n95-n05:.0f} ({(n95-n05)/n50*100:.1f}%)")
-
-    # Store results for dashboard output
-    for s_idx in range(S):
-        all_results.append({
-            "exposure_scenario": exp_label,
-            "exposure_multiplier": exp_mult,
-            "model": "poisson",
-            "simulation": s_idx,
-            "total_2025": int(tot_p[s_idx])
-        })
-        all_results.append({
-            "exposure_scenario": exp_label,
-            "exposure_multiplier": exp_mult,
-            "model": "neg_bin",
-            "simulation": s_idx,
-            "total_2025": int(tot_n[s_idx])
+        # Store result
+        results.append({
+            "simulation": s,
+            "weather_year": weather_year,
+            "exposure_year": exposure_year,
+            "growth_factor": growth_factor,
+            "model": model_name,
+            "total_2025": total
         })
 
+        # Cleanup
+        del df_sim, X, weather_matrix, exposure_values
+        if s % 50 == 0:
+            gc.collect()
 
-# ---- Save with Exposure Scenarios ----
+    return results
+
+# Run simulations (Poisson only - NB removed due to dispersion ~1)
+print("\nRunning Poisson simulations...")
+poisson_results = run_random_simulation(poisson_res, use_nb=False, model_name="poisson")
+
+# Combine results (Poisson only)
+all_results = poisson_results
 mc_df = pd.DataFrame(all_results)
+
+# Save results
 mc_path = OUT_DIR / "risk_mc_2025_totals_bike_all_scenarios.parquet"
 mc_df.to_parquet(mc_path, index=False)
+
 print("\n" + "="*70)
-print("SAVED MONTE CARLO RESULTS WITH EXPOSURE SCENARIOS")
+print("SAVED MONTE CARLO RESULTS (POISSON ONLY)")
 print("="*70)
 print("Saved:", mc_path)
-print(f"Total simulations: {len(mc_df)} rows ({S} per model × 2 models × {len(exposure_scenarios)} scenarios)")
-print("\nSample:")
-print(mc_df.groupby(['exposure_scenario', 'model'])['total_2025'].describe())
+print(f"Total simulations: {len(mc_df)} rows ({S} simulations)")
 
-# Model comparison with baseline scenario (actual exposure)
-baseline_df = mc_df[mc_df['exposure_scenario'] == 'actual'].copy()
-poisson_baseline = baseline_df[baseline_df['model'] == 'poisson']['total_2025'].values
-negbin_baseline = baseline_df[baseline_df['model'] == 'neg_bin']['total_2025'].values
+# Summary statistics
+print("\n" + "="*70)
+print("COMPREHENSIVE UNCERTAINTY SUMMARY")
+print("="*70)
 
-p05_base, p50_base, p95_base = np.quantile(poisson_baseline, [0.05, 0.5, 0.95])
-n05_base, n50_base, n95_base = np.quantile(negbin_baseline, [0.05, 0.5, 0.95])
+model_data = mc_df['total_2025'].values
+q05, q50, q95 = np.quantile(model_data, [0.05, 0.5, 0.95])
+print(f"\nPoisson:")
+print(f"  Median: {q50:,.0f}")
+print(f"  90% CI: [{q05:,.0f} – {q95:,.0f}]")
+print(f"  CI width: {q95 - q05:,.0f} crashes ({(q95 - q05) / q50 * 100:.1f}%)")
+
+# Distribution of sampled dimensions
+print("\n" + "="*70)
+print("SAMPLED DIMENSION DISTRIBUTIONS")
+print("="*70)
+print("\nWeather years sampled:")
+print(mc_df['weather_year'].value_counts().sort_index())
+print("\nExposure years sampled:")
+print(mc_df['exposure_year'].value_counts().sort_index())
+print("\nGrowth factors (summary):")
+print(f"  Min: {mc_df['growth_factor'].min():.3f}")
+print(f"  Max: {mc_df['growth_factor'].max():.3f}")
+print(f"  Mean: {mc_df['growth_factor'].mean():.3f}")
+
+# Model comparison (Poisson only)
+p05, p50, p95 = np.quantile(model_data, [0.05, 0.5, 0.95])
 
 cmp = pd.DataFrame([
-    {"model":"poisson", "aic": float(poisson_res.aic), "dispersion": float(np.sum(poisson_res.resid_pearson**2)/poisson_res.df_resid),
-     "q50_total_2025": float(p50_base), "q05_total_2025": float(p05_base), "q95_total_2025": float(p95_base)},
-    {"model":"neg_bin", "aic": float(nb_res.aic), "dispersion": float(np.sum(nb_res.resid_pearson**2)/nb_res.df_resid),
-     "alpha_mle": float(nb_res.scale),
-     "q50_total_2025": float(n50_base), "q05_total_2025": float(n05_base), "q95_total_2025": float(n95_base)},
+    {"model":"poisson", "aic": float(poisson_res.aic),
+     "dispersion": float(np.sum(poisson_res.resid_pearson**2)/poisson_res.df_resid),
+     "q50_total_2025": float(p50), "q05_total_2025": float(p05), "q95_total_2025": float(p95)},
 ])
 cmp_path = OUT_DIR / "model_comparison_bike_all.parquet"
 cmp.to_parquet(cmp_path, index=False)
-print("Saved:", cmp_path)
+print("\nSaved:", cmp_path)
 
-cmp
-
-
-# ============================================================================
-# STEP 5: Create Exposure Scenario Summary for Dashboard
-# ============================================================================
+# Create summary for dashboard (aggregated view)
+# Group by sampled dimensions to show effect of each
 print("\n" + "="*70)
-print("CREATING EXPOSURE SCENARIO SUMMARY FOR DASHBOARD")
+print("CREATING DASHBOARD SUMMARY")
 print("="*70)
 
-# Aggregate by exposure scenario and model
-scenario_summary = mc_df.groupby(['exposure_scenario', 'exposure_multiplier', 'model'])['total_2025'].agg([
+# Summary by exposure year (for dashboard box plot)
+scenario_summary = mc_df.groupby(['exposure_year'])['total_2025'].agg([
     ('q05', lambda x: np.quantile(x, 0.05)),
     ('q50', lambda x: np.quantile(x, 0.50)),
     ('q95', lambda x: np.quantile(x, 0.95)),
@@ -1023,11 +1435,17 @@ scenario_summary = mc_df.groupby(['exposure_scenario', 'exposure_multiplier', 'm
     ('std', 'std')
 ]).reset_index()
 
+# Add columns for dashboard compatibility
+scenario_summary['model'] = 'poisson'
+scenario_summary['exposure_scenario'] = scenario_summary['exposure_year'].astype(str) + "_random"
+scenario_summary['exposure_multiplier'] = 1.0  # Mixed, but we keep for compatibility
+
 scenario_summary_path = OUT_DIR / "risk_exposure_scenarios_summary.parquet"
 scenario_summary.to_parquet(scenario_summary_path, index=False)
 print("Saved:", scenario_summary_path)
-print("\nScenario Summary:")
-print(scenario_summary)
+
+print("\nSummary by Exposure Year (Poisson):")
+print(scenario_summary[['exposure_year', 'q05', 'q50', 'q95']])
 
 
 # In[ ]:
@@ -1040,18 +1458,18 @@ print(scenario_summary)
 
 
 # ============================================================================
-# CRITICAL FIX: Observed crashes 2025 - ONLY IN MODEL CELLS
+# EVALUATION: Compare predictions against crashes in 2025-ACTIVE cells
 # ============================================================================
-# The model can only predict for cells with CitiBike exposure.
-# Therefore, we must compare predictions against observed crashes
-# ONLY in those same cells. Otherwise we're comparing apples to oranges.
+# CRITICAL: Both prediction and observed must use the SAME cell set!
+# We use cells_2025 (cells with 2025 exposure) for both:
+# - Prediction: df2025 only contains cells_2025 (set above)
+# - Observed: Query filters to cells_2025
 #
-# Staten Island and other areas without CitiBike have crashes but
-# the model has E=0 there, so it would predict 0 crashes.
-# Including those in "observed" would inflate the observed count unfairly.
+# This is the correct approach for insurance use case:
+# "Given the areas where CitiBike operates in 2025, how many crashes do we expect?"
 # ============================================================================
 
-# First, get total crashes for context
+# Total crashes for context (all NYC)
 obs_all = con.execute(f"""
 SELECT
   SUM(y_bike) AS y_obs_all
@@ -1060,13 +1478,22 @@ WHERE hour_ts >= TIMESTAMP '2025-01-01'
   AND hour_ts <  TIMESTAMP '2026-01-01';
 """).fetch_df()['y_obs_all'].iloc[0]
 
-# Now get crashes ONLY in model cells (cells with exposure)
+# Crashes in training cells (for reference)
+obs_train_cells = con.execute(f"""
+SELECT SUM(c.y_bike) AS y_obs
+FROM read_parquet('{crash_cell_hour_path.as_posix()}') c
+INNER JOIN read_parquet('{cells_keep_path.as_posix()}') k USING(cell_id)
+WHERE c.hour_ts >= TIMESTAMP '2025-01-01'
+  AND c.hour_ts <  TIMESTAMP '2026-01-01';
+""").fetch_df()['y_obs'].iloc[0]
+
+# Crashes in 2025-ACTIVE cells - THIS IS WHAT WE EVALUATE AGAINST
 obs = con.execute(f"""
 SELECT
   date_trunc('month', c.hour_ts) AS month_ts,
   SUM(c.y_bike) AS y_obs
 FROM read_parquet('{crash_cell_hour_path.as_posix()}') c
-INNER JOIN read_parquet('{cells_keep_path.as_posix()}') k USING(cell_id)
+INNER JOIN read_parquet('{cells_2025_path.as_posix()}') k USING(cell_id)
 WHERE c.hour_ts >= TIMESTAMP '2025-01-01'
   AND c.hour_ts <  TIMESTAMP '2026-01-01'
 GROUP BY 1
@@ -1078,11 +1505,12 @@ obs_in_cells = obs['y_obs'].sum()
 print("\n" + "="*70)
 print("OBSERVED CRASHES BREAKDOWN (2025)")
 print("="*70)
-print(f"Total 2025 crashes (all areas):     {obs_all:,.0f}")
-print(f"Crashes IN model cells (with E):    {obs_in_cells:,.0f} ({obs_in_cells/obs_all*100:.1f}%)")
-print(f"Crashes OUTSIDE model cells (E=0):  {obs_all - obs_in_cells:,.0f} ({(obs_all - obs_in_cells)/obs_all*100:.1f}%)")
+print(f"Total 2025 crashes (all NYC):           {obs_all:,.0f}")
+print(f"Crashes in training cells:              {obs_train_cells:,.0f} ({obs_train_cells/obs_all*100:.1f}%)")
+print(f"Crashes in 2025-ACTIVE cells (eval):    {obs_in_cells:,.0f} ({obs_in_cells/obs_all*100:.1f}%)")
 print("="*70)
-print("⚠️  Model predictions are compared against IN-CELL crashes only!")
+print("✓ Prediction and observed use SAME cell set (2025-active cells)")
+print("  This ensures apples-to-apples comparison for insurance use case.")
 print("="*70)
 
 # ============================================================================
@@ -1107,47 +1535,42 @@ df2025["lat_lng"] = df2025["grid_lat_norm"] * df2025["grid_lng_norm"]
 print("df2025 prepared with all features")
 
 # ============================================================================
-# Expected from grid-model: sum over cells of mu_cellhour
+# Expected from grid-model: sum over cells of mu_cellday (DAILY aggregation)
 # ============================================================================
 def expected_monthly(res, label: str):
     import patsy
     design_info = res.model.data.design_info
     X = patsy.build_design_matrices([design_info], df2025, return_type="dataframe")[0]
-    
+
     # Align to X's index
     df_aligned = df2025.loc[X.index]
-    
+
     beta = res.params.loc[X.columns].values
     eta = X.values @ beta
-    
+
     # Clip for safety
     eta = np.clip(eta, -20, 20)
-    
-    mu = df_aligned["exposure_min"].values * np.exp(eta)
-    
-    tmp = pd.DataFrame({"hour_ts": df_aligned["hour_ts"].values, "mu": mu})
-    tmp["month_ts"] = pd.to_datetime(tmp["hour_ts"]).dt.to_period('M').dt.to_timestamp()
+
+    # With exposure as FEATURE, μ = exp(Xβ) - no separate exposure term!
+    # The exposure effect is INSIDE the design matrix via log1p_exposure
+    mu = np.exp(eta)
+
+    # NOTE: Using day_ts instead of hour_ts (daily aggregation)
+    tmp = pd.DataFrame({"day_ts": df_aligned["day_ts"].values, "mu": mu})
+    tmp["month_ts"] = pd.to_datetime(tmp["day_ts"]).dt.to_period('M').dt.to_timestamp()
     out = tmp.groupby("month_ts", as_index=False)["mu"].sum()
     out = out.rename(columns={"mu": f"y_pred_{label}"})
     return out
 
 pred_p = expected_monthly(poisson_res, "poisson")
-pred_n = expected_monthly(nb_res, "negbin")
 
-# Merge predictions (wide format first)
-eval_wide = obs.merge(pred_p, on="month_ts", how="left").merge(pred_n, on="month_ts", how="left")
+# Merge predictions (Poisson only)
+eval_wide = obs.merge(pred_p, on="month_ts", how="left")
 
-# Convert to LONG format for dashboard
-eval_long_poisson = eval_wide[["month_ts", "y_obs", "y_pred_poisson"]].copy()
-eval_long_poisson["model"] = "poisson"
-eval_long_poisson = eval_long_poisson.rename(columns={"y_obs": "observed", "y_pred_poisson": "pred_mean"})
-
-eval_long_nb = eval_wide[["month_ts", "y_obs", "y_pred_negbin"]].copy()
-eval_long_nb["model"] = "neg_bin"
-eval_long_nb = eval_long_nb.rename(columns={"y_obs": "observed", "y_pred_negbin": "pred_mean"})
-
-# Combine
-eval_df = pd.concat([eval_long_poisson, eval_long_nb], ignore_index=True)
+# Convert to LONG format for dashboard (Poisson only)
+eval_df = eval_wide[["month_ts", "y_obs", "y_pred_poisson"]].copy()
+eval_df["model"] = "poisson"
+eval_df = eval_df.rename(columns={"y_obs": "observed", "y_pred_poisson": "pred_mean"})
 
 # Save
 eval_path = OUT_DIR / "risk_eval_2025_monthly_bike_all.parquet"

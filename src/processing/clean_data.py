@@ -7,12 +7,12 @@ This script performs two main tasks:
 2. Clean and impute coordinates for bike-related crashes
 
 INPUTS:
-    - data/interim/crashes.parquet          (raw NYPD crash data)
+    - data/raw/crashes/crashes.parquet        (raw NYPD crash data)
     - data/interim/tripdata_2013_2025.parquet (raw CitiBike trips)
 
 OUTPUTS:
     - data/interim/tripdata_2013_2025_clean.parquet  (cleaned trips)
-    - data/processed/crashes_bike_clean.parquet       (bike crashes with imputed coords)
+    - data/interim/crashes_bike_clean.parquet        (bike crashes with imputed coords)
 
 METHODOLOGY:
     Trip Cleaning:
@@ -43,19 +43,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
 # Input files
-CRASH_RAW = DATA_DIR / "interim" / "crashes.parquet"
+CRASH_RAW = DATA_DIR / "raw" / "crashes" / "crashes.parquet"
 TRIPS_RAW = DATA_DIR / "interim" / "tripdata_2013_2025.parquet"
 
 # Output files
 TRIPS_CLEAN = DATA_DIR / "interim" / "tripdata_2013_2025_clean.parquet"
-CRASH_CLEAN = DATA_DIR / "processed" / "crashes_bike_clean.parquet"
+CRASH_CLEAN = DATA_DIR / "interim" / "crashes_bike_clean.parquet"
 
-# NYC bounding box (generous to include all boroughs)
-NYC_BBOX = {
+# NYC bounding boxes - separate for trips vs crashes
+# Trips: Exclude Jersey City (CitiBike expanded there, but no NYPD crash data)
+# Crashes: Include all NYC boroughs including Staten Island
+NYC_BBOX_TRIPS = {
     "lat_min": 40.50,
-    "lat_max": 41.00,
-    "lng_min": -74.30,
-    "lng_max": -73.50
+    "lat_max": 40.92,   # Northern Bronx boundary
+    "lng_min": -74.05,  # Hudson River (excludes Jersey City)
+    "lng_max": -73.70
+}
+
+# Crashes: Full NYC including Staten Island (which extends to ~-74.25)
+NYC_BBOX_CRASHES = {
+    "lat_min": 40.50,
+    "lat_max": 40.92,   # Northern Bronx boundary
+    "lng_min": -74.30,  # Include Staten Island
+    "lng_max": -73.70
 }
 
 # Trip duration bounds (seconds)
@@ -102,10 +112,10 @@ def clean_trips(con: duckdb.DuckDBPyConnection) -> None:
             WHERE duration_sec IS NOT NULL
               AND duration_sec >= {MIN_DURATION_SEC}
               AND duration_sec <= {MAX_DURATION_SEC}
-              AND start_lat BETWEEN {NYC_BBOX['lat_min']} AND {NYC_BBOX['lat_max']}
-              AND start_lng BETWEEN {NYC_BBOX['lng_min']} AND {NYC_BBOX['lng_max']}
-              AND end_lat BETWEEN {NYC_BBOX['lat_min']} AND {NYC_BBOX['lat_max']}
-              AND end_lng BETWEEN {NYC_BBOX['lng_min']} AND {NYC_BBOX['lng_max']}
+              AND start_lat BETWEEN {NYC_BBOX_TRIPS['lat_min']} AND {NYC_BBOX_TRIPS['lat_max']}
+              AND start_lng BETWEEN {NYC_BBOX_TRIPS['lng_min']} AND {NYC_BBOX_TRIPS['lng_max']}
+              AND end_lat BETWEEN {NYC_BBOX_TRIPS['lat_min']} AND {NYC_BBOX_TRIPS['lat_max']}
+              AND end_lng BETWEEN {NYC_BBOX_TRIPS['lng_min']} AND {NYC_BBOX_TRIPS['lng_max']}
         ) TO '{TRIPS_CLEAN}' (FORMAT PARQUET)
     """)
 
@@ -126,25 +136,26 @@ def classify_coordinates(row: pd.Series) -> tuple:
 
     Returns:
         tuple: (classification, latitude, longitude)
-            - 'valid': coordinates are usable as-is
-            - 'impute_borough': coordinates missing but borough known
-            - 'impute_citywide': coordinates and borough both missing
+            - 'valid': coordinates are usable as-is (within NYC bounds)
+            - 'impute_borough': coordinates missing/invalid but borough known → impute to borough
+            - 'impute_citywide': coordinates missing/invalid, no borough → impute citywide
     """
     lat, lng = row['latitude'], row['longitude']
+    borough = str(row['borough']).strip().upper()
 
     # Check if coordinates are valid and within NYC
     if (pd.notna(lat) and pd.notna(lng) and
         lat != 0.0 and lng != 0.0 and
-        NYC_BBOX['lat_min'] <= lat <= NYC_BBOX['lat_max'] and
-        NYC_BBOX['lng_min'] <= lng <= NYC_BBOX['lng_max']):
+        NYC_BBOX_CRASHES['lat_min'] <= lat <= NYC_BBOX_CRASHES['lat_max'] and
+        NYC_BBOX_CRASHES['lng_min'] <= lng <= NYC_BBOX_CRASHES['lng_max']):
         return 'valid', lat, lng
 
-    # Check if borough is known for targeted imputation
-    borough = str(row['borough']).strip().upper()
+    # If borough is known → impute within that borough
     if borough in BOROUGH_CENTROIDS:
         return 'impute_borough', None, None
 
-    # Fall back to citywide imputation
+    # No valid coordinates AND no NYC borough → impute citywide
+    # (NYPD data, so still NYC crashes - just missing location info)
     return 'impute_citywide', None, None
 
 
@@ -170,9 +181,9 @@ def impute_borough_coordinates(borough: str) -> tuple:
     lat = np.random.uniform(lat_c - lat_r, lat_c + lat_r)
     lng = np.random.uniform(lng_c - lng_r, lng_c + lng_r)
 
-    # Clip to NYC bounds
-    lat = np.clip(lat, NYC_BBOX['lat_min'], NYC_BBOX['lat_max'])
-    lng = np.clip(lng, NYC_BBOX['lng_min'], NYC_BBOX['lng_max'])
+    # Clip to NYC bounds (use crash bounding box for imputation)
+    lat = np.clip(lat, NYC_BBOX_CRASHES['lat_min'], NYC_BBOX_CRASHES['lat_max'])
+    lng = np.clip(lng, NYC_BBOX_CRASHES['lng_min'], NYC_BBOX_CRASHES['lng_max'])
 
     return lat, lng
 
@@ -239,29 +250,26 @@ def clean_crashes(con: duckdb.DuckDBPyConnection) -> None:
     print(f"  Borough impute:  {n_borough:,} ({n_borough/len(crashes)*100:.1f}%)")
     print(f"  Citywide impute: {n_citywide:,} ({n_citywide/len(crashes)*100:.1f}%)")
 
-    # Step 3: Impute missing coordinates
-    print("\nImputing missing coordinates...")
-
-    # Get valid crashes for citywide sampling
+    # Step 3: Get valid crashes for citywide sampling
     valid_crashes = crashes[crashes['coord_type'] == 'valid'].copy()
+
+    # Step 4: Impute missing coordinates
+    print("\nImputing coordinates...")
 
     for idx, row in crashes.iterrows():
         if row['coord_type'] == 'valid':
             continue
 
         if row['coord_type'] == 'impute_borough':
+            # Impute within known borough
             borough = str(row['borough']).strip().upper()
             lat, lng = impute_borough_coordinates(borough)
             if lat is not None:
                 crashes.at[idx, 'lat_clean'] = lat
                 crashes.at[idx, 'lng_clean'] = lng
-            else:
-                # Fallback to citywide if borough imputation fails
-                sample = valid_crashes.sample(n=1)
-                crashes.at[idx, 'lat_clean'] = sample['lat_clean'].iloc[0]
-                crashes.at[idx, 'lng_clean'] = sample['lng_clean'].iloc[0]
-        else:
-            # Citywide: sample from valid crash distribution
+
+        elif row['coord_type'] == 'impute_citywide':
+            # Sample from valid crash distribution (citywide)
             sample = valid_crashes.sample(n=1)
             crashes.at[idx, 'lat_clean'] = sample['lat_clean'].iloc[0]
             crashes.at[idx, 'lng_clean'] = sample['lng_clean'].iloc[0]
@@ -270,7 +278,7 @@ def clean_crashes(con: duckdb.DuckDBPyConnection) -> None:
     missing = crashes[['lat_clean', 'lng_clean']].isna().any(axis=1).sum()
     assert missing == 0, f"Still have {missing} missing coordinates!"
 
-    # Step 4: Select and save final columns
+    # Step 5: Select and save final columns
     final_columns = [
         'crash_date', 'crash_time', 'borough', 'zip_code',
         'lat_clean', 'lng_clean',

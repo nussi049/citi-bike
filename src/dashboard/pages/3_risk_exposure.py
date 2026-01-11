@@ -22,7 +22,6 @@ from src.dashboard.lib.settings import (
     EVAL_2025,
     COMP,
     MC_2025_SCENARIOS,
-    EXPOSURE_SCENARIOS_SUMMARY,
     PROXY_TEST_BM,
     BIKE_COUNTERS,
     BIKE_COUNTS_HOURLY,
@@ -576,6 +575,15 @@ else:
                 """)
 
         st.markdown("---")
+
+        # Data quality warning for 2022
+        if 2022 in selected_years:
+            st.warning("""
+            **Note on 2022 Data:** In 2022, CitiBike recorded raw GPS coordinates instead of fixed station locations.
+            Approximately 0.01% of trips have GPS errors placing them in incorrect grid cells. This causes 2022 to
+            show slightly more grid cells in outer areas compared to other years. The effect on the model is negligible.
+            """)
+
         st.caption(f"""
         **Map Details:**
         - Grid cells: 2.5km × 2.5km (GRID_DEG=0.025)
@@ -630,23 +638,23 @@ train = train[train["exposure_min"] > 0].copy()
 # =============================
 # A) High-level KPIs
 # =============================
-st.subheader("A) High-level summary (training window 2020–2024, forecast year 2025)")
+st.subheader("A) High-level summary (training 2021–2024, forecast 2025)")
 
 # FIXED: Use grid_complete for ACTUAL crash/exposure totals (consistent with maps)
 if not grid_complete.empty:
-    grid_2020_2024 = grid_complete[
-        (grid_complete['hour_ts'] >= '2020-01-01') & 
+    grid_2021_2024 = grid_complete[
+        (grid_complete['hour_ts'] >= '2021-01-01') &
         (grid_complete['hour_ts'] < '2025-01-01')
     ].copy()
     
     # Total observed crashes (ALL areas, including non-CitiBike)
-    obs_train_total = float(grid_2020_2024['y_bike'].sum())
-    
+    obs_train_total = float(grid_2021_2024['y_bike'].sum())
+
     # Total exposure (only CitiBike areas)
-    exp_train_total = float(grid_2020_2024[grid_2020_2024['exposure_min'] > 0]['exposure_min'].sum())
-    
+    exp_train_total = float(grid_2021_2024[grid_2021_2024['exposure_min'] > 0]['exposure_min'].sum())
+
     # Rate calculated on CitiBike areas only
-    crashes_with_exposure = grid_2020_2024[grid_2020_2024['exposure_min'] > 0]
+    crashes_with_exposure = grid_2021_2024[grid_2021_2024['exposure_min'] > 0]
     train_rate = rate_per_100k(
         float(crashes_with_exposure['y_bike'].sum()),
         float(crashes_with_exposure['exposure_min'].sum())
@@ -662,52 +670,147 @@ pred_2025 = (
     .rename(columns={"pred_mean": "pred_total_2025"})
 )
 pred_poisson = float(pred_2025.loc[pred_2025["model"] == "poisson", "pred_total_2025"].iloc[0]) if (pred_2025["model"] == "poisson").any() else float("nan")
-pred_nb = float(pred_2025.loc[pred_2025["model"] == "neg_bin", "pred_total_2025"].iloc[0]) if (pred_2025["model"] == "neg_bin").any() else float("nan")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Observed bike crashes (2020–2024)", fmt_int(obs_train_total))
-c2.metric("Exposure minutes (2020–2024)", fmt_int(exp_train_total))
+c1.metric("Observed bike crashes (2021–2024)", fmt_int(obs_train_total))
+c2.metric("Exposure minutes (2021–2024)", fmt_int(exp_train_total))
 c3.metric("Rate per 100k exposure-min (train)", fmt_float(train_rate, 3))
 c4.metric("Observed bike crashes (2025)", fmt_int(obs_2025_total))
 
-c5, c6 = st.columns(2)
+c5, _ = st.columns(2)
 c5.metric("Predicted 2025 total (Poisson mean)", fmt_int(pred_poisson))
-c6.metric("Predicted 2025 total (NegBin mean)", fmt_int(pred_nb))
 
 st.caption(
-    "**Model:** log(μ) = log(exposure_min) + Xβ, where Xβ includes temporal, spatial, trend, and weather effects. "
+    "**Model:** log(μ) = Xβ, where Xβ includes log1p(exposure) as feature + temporal, spatial, and weather effects. "
     "See Section G for full GLM specification."
 )
 
 # Model limitation explanation (always visible)
+st.markdown("---")
+st.subheader("A) Model Methodology & Historical Analysis")
+
 st.markdown("""
----
-### Model Limitation
+#### Daily Aggregation (Memory Efficient)
 
-**"Observed bike crashes (2025)" only includes crashes in grid cells where CitiBike exposure exists.**
+The model uses **daily** data (~117K rows) instead of hourly (~2.8M rows) for memory efficiency.
+This allows running on 8GB RAM machines. Hour-of-day patterns are shown below from raw hourly data.
 
-**Methodology:** We use CitiBike trip minutes as a proxy for cycling exposure. Each trip's duration
-is assigned to the grid cell of its **start station**. Only cells with CitiBike stations are included
-in the model (~65 cells). Crashes occurring outside these cells are excluded from both training and evaluation.
+#### Evaluation Consistency
 
-**Known bias:** This approach systematically excludes:
-- Crashes in areas without CitiBike stations (Staten Island, outer Bronx/Queens/Brooklyn)
-- Crashes along trip routes between start and end stations (mid-route exposure not captured)
+**Critical:** Predictions and observed crashes use the **same cell set** (cells with 2025 exposure).
 
-**Why this is still valid:**
-1. **Symmetric station network** – start and end stations share the same geographic distribution,
-   so cells with high start activity also have high end activity over time
-2. **Short trip distances** – average trip duration is ~13 minutes, meaning most rides stay within
-   2-3 cells of the start station. The true exposure is slightly more spread out than modeled,
-   but remains concentrated around the same hotspots
-3. **Stable coverage** – CitiBike hotspots have remained consistent across years, meaning the
-   bias is constant rather than variable
-4. **High coverage** – ~77% of all NYC bike crashes occur within the ~65 CitiBike cells
-5. **Validated proxy** – CitiBike activity correlates strongly with NYC bike counter data
-   (see proxy validation below)
+- **Prediction**: Only for cells that had CitiBike activity in 2025
+- **Observed**: Only crashes in cells with 2025 CitiBike exposure
 
-**Interpretation:** The model accurately predicts crash rates *within the CitiBike coverage area*.
-It should not be used to predict crashes in areas without CitiBike infrastructure.
+This ensures an apples-to-apples comparison for insurance use cases:
+> "Given the areas where CitiBike operates in 2025, how many crashes do we expect?"
+""")
+
+# =============================
+# DYNAMIC: Historical Exposure & Crash Analysis
+# =============================
+st.markdown("#### Historical Exposure, Crashes & Crash Rate (in 2025-active cells)")
+
+# Load cells_2025 for filtering
+cells_2025_path = CELLS_KEEP.parent / "grid_cells_2025.parquet"
+if cells_2025_path.exists():
+    cells_2025_df = pd.read_parquet(cells_2025_path)
+    active_cells = set(cells_2025_df['cell_id'].tolist())
+
+    # Calculate exposure and crashes per year in active cells
+    @st.cache_data
+    def compute_historical_stats():
+        # Load exposure data
+        exposure_train = pd.read_parquet(EXPOSURE_CELL_HOUR_TRAIN)
+        exposure_test = pd.read_parquet(EXPOSURE_CELL_HOUR_TEST)
+        exposure = pd.concat([exposure_train, exposure_test], ignore_index=True)
+        exposure['hour_ts'] = pd.to_datetime(exposure['hour_ts'])
+        exposure['year'] = exposure['hour_ts'].dt.year
+
+        # Load crashes
+        crashes = pd.read_parquet(CRASH_CELL_HOUR)
+        crashes['hour_ts'] = pd.to_datetime(crashes['hour_ts'])
+        crashes['year'] = crashes['hour_ts'].dt.year
+
+        # Filter to active cells
+        exposure_in_cells = exposure[exposure['cell_id'].isin(active_cells)]
+        crashes_in_cells = crashes[crashes['cell_id'].isin(active_cells)]
+
+        # Aggregate by year
+        exp_by_year = exposure_in_cells.groupby('year')['exposure_min'].sum() / 1_000_000
+        crash_by_year = crashes_in_cells.groupby('year')['y_bike'].sum()
+
+        # Combine
+        hist_df = pd.DataFrame({
+            'Exposure (M min)': exp_by_year.round(1),
+            'Crashes': crash_by_year.astype(int)
+        })
+        hist_df['Crash Rate (per 100k min)'] = (
+            hist_df['Crashes'] / (hist_df['Exposure (M min)'] * 1_000_000) * 100_000
+        ).round(2)
+
+        return hist_df
+
+    hist_stats = compute_historical_stats()
+
+    # Calculate averages (training period 2021-2024, excludes COVID 2020)
+    avg_exp = hist_stats.loc[2021:2024, 'Exposure (M min)'].mean()
+    avg_crash = hist_stats.loc[2021:2024, 'Crashes'].mean()
+    avg_rate = hist_stats.loc[2021:2024, 'Crash Rate (per 100k min)'].mean()
+
+    # Add comparison columns
+    hist_display = hist_stats.copy()
+    hist_display['vs Avg Rate'] = ((hist_display['Crash Rate (per 100k min)'] / avg_rate - 1) * 100).round(1).astype(str) + '%'
+    hist_display.index.name = 'Year'
+
+    # Display table
+    st.dataframe(hist_display, use_container_width=True)
+
+    # Key insights
+    exp_2025 = hist_stats.loc[2025, 'Exposure (M min)']
+    crash_2025 = hist_stats.loc[2025, 'Crashes']
+    rate_2025 = hist_stats.loc[2025, 'Crash Rate (per 100k min)']
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric(
+        "2025 Exposure vs Train Avg",
+        f"{exp_2025:.0f}M min",
+        f"{((exp_2025/avg_exp)-1)*100:+.1f}%"
+    )
+    col2.metric(
+        "2025 Crashes vs Train Avg",
+        f"{crash_2025:,.0f}",
+        f"{((crash_2025/avg_crash)-1)*100:+.1f}%"
+    )
+    col3.metric(
+        "2025 Crash Rate vs Train Avg",
+        f"{rate_2025:.2f}",
+        f"{((rate_2025/avg_rate)-1)*100:+.1f}%"
+    )
+
+    st.markdown(f"""
+    **Key Insight:** While 2025 exposure is **+{((exp_2025/avg_exp)-1)*100:.0f}% above** the 2021-2024 training average,
+    the crash rate dropped by **{((1-rate_2025/avg_rate))*100:.0f}%** - from {avg_rate:.2f} to {rate_2025:.2f} per 100k minutes.
+
+    The model's trend variable captures this declining rate, predicting continued improvement in 2025.
+    """)
+else:
+    st.warning("Historical analysis not available - cells_2025 file not found.")
+
+st.markdown("""
+#### Exposure Methodology
+
+**Line Interpolation:** Trip duration is distributed across grid cells along the straight line
+between start and end station (5 interpolation points).
+
+**CitiBike as Proxy:** Validated at Borough × Month level (r ≈ 0.85), but spatial distribution
+within boroughs is assumed, not validated.
+
+#### Key Limitations
+
+1. **Spatial gaps:** ~7% of NYC crashes occur outside model coverage (Staten Island, outer areas)
+2. **Proxy drift:** CitiBike grows faster than total cycling in Brooklyn/Queens
+3. **Reporting delays:** Recent crashes may not be fully reported
 
 ---
 """)
@@ -716,22 +819,24 @@ It should not be used to predict crashes in areas without CitiBike infrastructur
 # =============================
 # B) Model comparison
 # =============================
-st.subheader("B) Model comparison (Poisson vs Negative Binomial)")
+st.subheader("B) Model Diagnostics (Poisson)")
 
 comp_show = comp.copy()
-for col in ["aic", "llf", "dispersion", "alpha"]:
+for col in ["aic", "llf", "dispersion"]:
     if col in comp_show.columns:
         comp_show[col] = pd.to_numeric(comp_show[col], errors="coerce")
 
 if "dispersion" in comp_show.columns:
     comp_show["dispersion"] = comp_show["dispersion"].map(lambda x: float(x) if pd.notna(x) else np.nan)
 
-st.dataframe(comp_show, width="stretch")
+st.dataframe(comp_show, use_container_width=True)
 
 st.markdown("""
-**How to choose:**
-- If Poisson **dispersion (Pearson χ²/df)** is far above 1, the data are more variable than Poisson allows (overdispersion).
-- Negative Binomial often fits better under overdispersion. Compare **AIC** (lower is better).
+**Model Selection:** Poisson GLM (Negative Binomial removed - dispersion ~1 indicates no overdispersion)
+
+**Key metrics:**
+- **Dispersion (Pearson χ²/df):** Values near 1 indicate good fit. Our value ~1.002 confirms Poisson is appropriate.
+- **AIC:** Lower is better for model comparison.
 """)
 
 
@@ -748,7 +853,7 @@ obs_line["series"] = "Observed"
 obs_line.rename(columns={"observed": "value"}, inplace=True)
 
 pred_line = plot_df[["month_ts", "model", "pred_mean"]].copy()
-pred_line["series"] = pred_line["model"].map({"poisson": "Poisson (mean)", "neg_bin": "NegBin (mean)"}).fillna(pred_line["model"])
+pred_line["series"] = pred_line["model"].map({"poisson": "Poisson (mean)"}).fillna(pred_line["model"])
 pred_line.rename(columns={"pred_mean": "value"}, inplace=True)
 
 lines = pd.concat([obs_line[["month_ts", "series", "value"]], pred_line[["month_ts", "series", "value"]]], ignore_index=True)
@@ -766,56 +871,111 @@ chart = (
 )
 st.altair_chart(chart, width="stretch")
 
+# Monthly deviation analysis
+st.markdown("#### Monthly Prediction Error Analysis (Poisson)")
+
+# Get Poisson predictions
+poisson_eval = eval_2025[eval_2025['model'] == 'poisson'].copy()
+if not poisson_eval.empty:
+    poisson_eval['month'] = pd.to_datetime(poisson_eval['month_ts']).dt.month
+    poisson_eval['month_name'] = pd.to_datetime(poisson_eval['month_ts']).dt.strftime('%b')
+    poisson_eval['diff'] = poisson_eval['pred_mean'] - poisson_eval['observed']
+    poisson_eval['diff_pct'] = ((poisson_eval['pred_mean'] / poisson_eval['observed']) - 1) * 100
+
+    # Summary metrics
+    summer_months = [6, 7, 8, 9]
+    summer_error = poisson_eval[poisson_eval['month'].isin(summer_months)]['diff'].sum()
+    other_error = poisson_eval[~poisson_eval['month'].isin(summer_months)]['diff'].sum()
+    total_error = poisson_eval['diff'].sum()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Summer (Jun-Sep) Error", f"{summer_error:+,.0f}", f"{summer_error/total_error*100:.0f}% of total")
+    col2.metric("Other Months Error", f"{other_error:+,.0f}", f"{other_error/total_error*100:.0f}% of total")
+    col3.metric("Total Error", f"{total_error:+,.0f}", f"{total_error/poisson_eval['observed'].sum()*100:+.1f}%")
+
+    # Bar chart of monthly errors
+    error_chart = (
+        alt.Chart(poisson_eval)
+        .mark_bar()
+        .encode(
+            x=alt.X("month_name:N", title="Month", sort=['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']),
+            y=alt.Y("diff:Q", title="Prediction Error (Predicted - Observed)"),
+            color=alt.condition(
+                alt.datum.diff > 0,
+                alt.value("#e74c3c"),  # Red for overprediction
+                alt.value("#27ae60")   # Green for underprediction
+            ),
+            tooltip=[
+                alt.Tooltip("month_name:N", title="Month"),
+                alt.Tooltip("observed:Q", title="Observed", format=",.0f"),
+                alt.Tooltip("pred_mean:Q", title="Predicted", format=",.0f"),
+                alt.Tooltip("diff:Q", title="Error", format="+,.0f"),
+                alt.Tooltip("diff_pct:Q", title="Error %", format="+.1f")
+            ]
+        )
+        .properties(height=250)
+    )
+    st.altair_chart(error_chart, use_container_width=True)
+
+    st.caption("""
+    **Insight:** The model systematically overpredicts summer months (Jun-Sep).
+    This could indicate: (1) unusual summer 2025 conditions not captured by historical patterns,
+    (2) reporting delays for recent months, or (3) a structural shift in cycling behavior.
+    """)
+
+st.markdown("---")
 
 # =============================
-# D) Uncertainty (Monte Carlo)
+# D) Uncertainty (Monte Carlo - Fully Random Simulation)
 # =============================
 st.subheader("D) Uncertainty of total 2025 crashes (Monte Carlo)")
 
-# Use scenario data (actual scenario) instead of old mc_2025 file
-# This ensures we're using the corrected IN-CELL predictions
-mc_scenarios_full = read_parquet_safe(MC_2025_SCENARIOS)
+mc_scenarios = read_parquet_safe(MC_2025_SCENARIOS)
 
-if mc_scenarios_full.empty or "total_2025" not in mc_scenarios_full.columns:
+if mc_scenarios.empty:
     st.warning("Monte Carlo dataset is missing or invalid. Run `make modeling` to generate.")
 else:
-    # Filter to "actual" scenario only for this section
-    mc = mc_scenarios_full[mc_scenarios_full['exposure_scenario'] == 'actual'].copy()
-    mc["total_2025"] = pd.to_numeric(mc["total_2025"], errors="coerce")
-    mc = mc.dropna(subset=["total_2025"]).copy()
+    # Filter to Poisson model (better fit based on AIC/dispersion analysis)
+    mc_poisson = mc_scenarios[mc_scenarios['model'] == 'poisson'].copy()
 
-    # Get observed from eval_2025 (already filtered to IN-CELL)
-    obs_2025_in_cell = float(eval_2025.drop_duplicates(subset=["month_ts"])[["observed"]].fillna(0)["observed"].sum())
+    if not mc_poisson.empty:
+        # Calculate statistics
+        all_q05, all_q50, all_q95 = np.quantile(mc_poisson['total_2025'].values, [0.05, 0.5, 0.95])
+        obs_2025_in_cell = float(eval_2025.drop_duplicates(subset=["month_ts"])[["observed"]].fillna(0)["observed"].sum())
 
-    q = (
-        mc.groupby("model")["total_2025"]
-        .quantile([0.05, 0.5, 0.95])
-        .unstack()
-        .reset_index()
-        .rename(columns={0.05: "q05", 0.5: "q50", 0.95: "q95"})
-    )
+        # Explanation
+        st.markdown("""
+        **Comprehensive Uncertainty Quantification (Poisson Model)**
 
-    # Add observed for comparison
-    st.markdown(f"**Observed 2025 (IN-CELL only):** {obs_2025_in_cell:,.0f} crashes")
-    st.caption("Note: Only crashes in areas with CitiBike exposure are counted, matching model coverage.")
+        Each simulation randomly samples **all** uncertainty dimensions:
 
-    left, right = st.columns([1, 1])
-    with left:
-        st.markdown("**Simulation quantiles (total 2025):**")
-        st.dataframe(q, width="stretch")
+        | Dimension | Sampling | Purpose |
+        |-----------|----------|---------|
+        | Weather | Uniform from 2021-2025 | Captures year-to-year weather variability |
+        | Exposure | Uniform from 2021-2025 | Captures different cycling activity patterns |
+        | Growth | Uniform(0.80, 1.20) | Continuous ±20% exposure estimation uncertainty |
+        | Parameters | MVN from covariance matrix | Model coefficient uncertainty |
 
-    with right:
-        st.markdown("**Distribution (histogram):**")
+        This produces a distribution reflecting the full range of plausible scenarios.
+        """)
+
+        # KPI cards
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Median Prediction", f"{all_q50:,.0f}")
+        col2.metric("90% CI Lower", f"{all_q05:,.0f}")
+        col3.metric("90% CI Upper", f"{all_q95:,.0f}")
+        col4.metric("Observed 2025", f"{obs_2025_in_cell:,.0f}")
+
+        # Histogram
+        st.markdown("**Distribution of predicted 2025 crashes:**")
         hist = (
-            alt.Chart(mc)
-            .mark_bar(opacity=0.7)
+            alt.Chart(mc_poisson)
+            .mark_bar(opacity=0.7, color='steelblue')
             .encode(
-                x=alt.X("total_2025:Q", bin=alt.Bin(maxbins=40), title="Total crashes in 2025"),
+                x=alt.X("total_2025:Q", bin=alt.Bin(maxbins=30), title="Total crashes in 2025"),
                 y=alt.Y("count():Q", title="Simulation count"),
-                color=alt.Color("model:N", title="Model"),
-                tooltip=["model:N", alt.Tooltip("count():Q", title="count")],
             )
-            .properties(height=320)
+            .properties(height=300)
         )
 
         # Add observed line
@@ -823,115 +983,16 @@ else:
             color='red', strokeWidth=2, strokeDash=[5,5]
         ).encode(x='observed:Q')
 
-        st.altair_chart(hist + obs_rule, use_container_width=True)
+        obs_text = alt.Chart(pd.DataFrame({'observed': [obs_2025_in_cell], 'label': ['Observed']})).mark_text(
+            align='left', dx=5, dy=-10, color='red', fontSize=12
+        ).encode(x='observed:Q', text='label:N')
 
+        st.altair_chart(hist + obs_rule + obs_text, use_container_width=True)
 
-# =============================
-# D2) Exposure Scenarios Analysis
-# =============================
-st.subheader("D2) What if bike usage changes? (Exposure Scenarios)")
-
-# Load scenario data
-mc_scenarios = read_parquet_safe(MC_2025_SCENARIOS)
-scenario_summary = read_parquet_safe(EXPOSURE_SCENARIOS_SUMMARY)
-
-if mc_scenarios.empty or scenario_summary.empty:
-    st.info("""
-    **Exposure scenario data not available.**
-
-    Run the modeling pipeline with the updated script to generate exposure scenarios:
-    ```bash
-    make modeling
-    ```
-
-    This will simulate how crash predictions change with different exposure levels:
-    - **-10%**: If bike usage decreases by 10%
-    - **actual**: Real 2025 exposure
-    - **+10%**: If bike usage increases by 10%
-    """)
-else:
-    st.markdown("""
-    **Policy Question:** How would predicted crashes change if bike usage (exposure) were different?
-
-    The model simulates three scenarios for 2025:
-    - **-10%**: Reduced bike usage (e.g., bad weather year, fewer bike lanes)
-    - **actual**: Real 2025 CitiBike exposure
-    - **+10%**: Increased bike usage (e.g., bike lane expansion, e-bike growth)
-    """)
-
-    # Show summary table
-    st.markdown("**Scenario Summary (Total 2025 Crashes):**")
-
-    # Pivot for better display
-    summary_display = scenario_summary.copy()
-    summary_display['scenario'] = summary_display['exposure_scenario']
-    summary_display['q50'] = summary_display['q50'].round(0).astype(int)
-    summary_display['q05'] = summary_display['q05'].round(0).astype(int)
-    summary_display['q95'] = summary_display['q95'].round(0).astype(int)
-    summary_display['90% CI'] = summary_display.apply(
-        lambda r: f"[{r['q05']:,} – {r['q95']:,}]", axis=1
-    )
-
-    # Create pivot table
-    pivot_table = summary_display.pivot(
-        index='scenario',
-        columns='model',
-        values=['q50', '90% CI']
-    ).reset_index()
-
-    # Flatten column names
-    pivot_table.columns = [
-        'Scenario' if col[0] == 'scenario' else f"{col[1].title()} {col[0]}"
-        for col in pivot_table.columns
-    ]
-
-    # Reorder scenarios
-    scenario_order = ['-10%', 'actual', '+10%']
-    pivot_table['sort_key'] = pivot_table['Scenario'].map({s: i for i, s in enumerate(scenario_order)})
-    pivot_table = pivot_table.sort_values('sort_key').drop(columns=['sort_key'])
-
-    st.dataframe(pivot_table, use_container_width=True, hide_index=True)
-
-    # Key insights
-    with st.expander("📊 Key Insights from Exposure Scenarios"):
-        # Calculate percentage changes
-        actual_row = scenario_summary[
-            (scenario_summary['exposure_scenario'] == 'actual') &
-            (scenario_summary['model'] == 'neg_bin')
-        ]
-        if not actual_row.empty:
-            actual_median = actual_row['q50'].iloc[0]
-
-            minus10_row = scenario_summary[
-                (scenario_summary['exposure_scenario'] == '-10%') &
-                (scenario_summary['model'] == 'neg_bin')
-            ]
-            plus10_row = scenario_summary[
-                (scenario_summary['exposure_scenario'] == '+10%') &
-                (scenario_summary['model'] == 'neg_bin')
-            ]
-
-            if not minus10_row.empty and not plus10_row.empty:
-                minus10_median = minus10_row['q50'].iloc[0]
-                plus10_median = plus10_row['q50'].iloc[0]
-
-                change_minus = ((minus10_median - actual_median) / actual_median) * 100
-                change_plus = ((plus10_median - actual_median) / actual_median) * 100
-
-                st.markdown(f"""
-                **Model: Negative Binomial**
-
-                | Scenario | Predicted Crashes | Change from Actual |
-                |----------|------------------:|-------------------:|
-                | -10% Exposure | {minus10_median:,.0f} | {change_minus:+.1f}% |
-                | Actual 2025 | {actual_median:,.0f} | — |
-                | +10% Exposure | {plus10_median:,.0f} | {change_plus:+.1f}% |
-
-                **Interpretation:**
-                - The relationship between exposure and crashes is approximately **linear** (as expected from the log-linear model)
-                - A 10% increase in bike usage leads to roughly **{change_plus:.0f}% more crashes**
-                - This supports the "safety in numbers" hypothesis: more cyclists = more crashes in absolute terms, but the rate may stay similar
-                """)
+        st.caption(f"""
+        **Note:** {len(mc_poisson)} simulations (Poisson model).
+        Red dashed line = observed 2025 crashes in model cells.
+        """)
 
 st.markdown("---")
 
@@ -1231,59 +1292,111 @@ st.markdown("---")
 # =============================
 # G) Model Limitations & Caveats
 # =============================
-st.subheader("G) Model Limitations & Methodological Caveats")
+st.subheader("G) Model Methodology & Limitations")
 
 st.markdown("""
-### Known Limitations
+### Critical Methodological Decisions
 
-This model provides probabilistic crash predictions, but users should be aware of the following limitations:
+This section documents key methodological choices and their implications for interpretation.
 """)
 
-col1, col2 = st.columns(2)
-
-with col1:
+# --- Training/Evaluation Consistency ---
+with st.expander("Training/Evaluation Consistency (Updated)", expanded=True):
     st.markdown("""
-    #### Spatial Coverage
-    - **79% of crashes** are in areas with CitiBike exposure (model cells)
-    - **21% of crashes** occur outside model coverage (Staten Island, outer Bronx, parts of Queens)
-    - The model **cannot predict** for areas without CitiBike
+    #### Exposure as Feature: Full Grid Coverage
 
-    #### Proxy Validity
-    - CitiBike is used as proxy for total cycling exposure
-    - Correlation with bike counters: **r = 0.82** (2024)
-    - In Brooklyn/Queens, CitiBike grows **3-5x faster** than total cycling
-    - This may introduce systematic bias in these boroughs
+    With exposure modeled as a **feature** (not offset), the model now covers ALL hours:
+
+    - **Training:** Complete grid (cell × hour) with exposure=0 where no CitiBike trips
+    - **Prediction:** For ALL hours, including exposure=0 (log1p(0) = 0)
+    - **Evaluation:** Against ALL crashes in model cells
+
+    **Key insight:** The model learns a baseline crash rate even without CitiBike exposure.
+    The `log1p_exposure` coefficient (β ≈ 0.42) captures how exposure increases crash risk.
     """)
 
-with col2:
-    st.markdown("""
-    #### Temporal Extrapolation
-    - Model trained on **2020-2024**, applied to **2025**
-    - Crash rate declined from **1.58** (2020) to **0.99** (2025) per 100k exp-min
-    - A linear trend term is included, but the decline was **non-linear** (structural break in 2024)
-    - Predictions carry **extrapolation uncertainty**
+# --- Proxy Limitations ---
+with st.expander("CitiBike as Cycling Proxy: Strengths & Weaknesses", expanded=True):
+    col1, col2 = st.columns(2)
 
-    #### Uncertainty Quantification
-    - Monte Carlo simulation captures **parameter + weather uncertainty**
-    - Does **not** capture: trend extrapolation risk, proxy drift, spatial coverage gaps
-    - Confidence intervals may be **narrower than true uncertainty**
+    with col1:
+        st.markdown("""
+        #### What the Proxy Captures
+
+        **Temporal Variation (validated):**
+        - Borough × Month correlation: **r ≈ 0.85**
+        - When a borough has 2× CitiBike activity, counters show ~2× cyclists
+        - Seasonal and monthly patterns are well-captured
+
+        **Spatial Variation (assumed):**
+        - We assume CitiBike station density ≈ cyclist density within boroughs
+        - Plausible because bike-share infrastructure follows demand
+        - NOT directly validated at grid level
+        """)
+
+    with col2:
+        st.markdown("""
+        #### What the Proxy Misses
+
+        **Systematic Biases:**
+        - CitiBike grows 3-5× faster than total cycling in Brooklyn/Queens
+        - Private bike usage not captured
+        - Delivery cyclists (growing rapidly) underrepresented
+
+        **Spatial Gaps:**
+        - Staten Island: 0% coverage (no CitiBike)
+        - Outer Bronx/Queens: limited coverage
+        - ~21% of NYC crashes in uncovered areas
+
+        **Temporal Gaps:**
+        - Night hours (2-5 AM): minimal CitiBike activity
+        - Winter months: reduced CitiBike usage
+        """)
+
+# --- Uncertainty Quantification ---
+with st.expander("Uncertainty Quantification: What's Captured & What's Not"):
+    st.markdown("""
+    #### Monte Carlo Simulation (1000 draws)
+
+    **Uncertainty Sources CAPTURED:**
+    - **Parameter uncertainty:** Coefficients sampled from multivariate normal (using covariance matrix)
+    - **Weather uncertainty:** Bootstrap entire years (preserves temporal autocorrelation)
+    - **Exposure uncertainty:** Historical exposure patterns from 2021-2025
+    - **Growth uncertainty:** ±20% exposure growth factor
+
+    **Uncertainty Sources NOT CAPTURED:**
+    - **Proxy drift:** CitiBike share of cycling may change over time
+    - **Model misspecification:** Functional form may be wrong
+    - **Spatial coverage gaps:** No uncertainty for areas without CitiBike
+    - **External shocks:** COVID recovery, e-bike adoption, infrastructure changes
+
+    **Implication:** Reported confidence intervals are likely **narrower than true uncertainty**.
+    For policy decisions, add ±10-15% to the reported intervals.
     """)
 
+# --- Recommendations ---
 with st.expander("Recommendations for Interpretation"):
     st.markdown("""
     ### How to Use These Predictions
 
-    1. **Use the confidence intervals**, not just point estimates
-    2. **Focus on Manhattan** where proxy quality is highest (correlation stable, growth aligned)
-    3. **Be cautious about Brooklyn/Queens** predictions due to proxy drift
-    4. **Do not extrapolate** to Staten Island or areas without CitiBike coverage
-    5. **Monitor actual 2025 data** to validate predictions and recalibrate if needed
+    #### Do:
+    1. **Use confidence intervals**, not point estimates
+    2. **Focus on Manhattan** — proxy quality is highest here
+    3. **Use for relative comparisons** — "10% more exposure → ~10% more crashes"
+    4. **Validate against actuals** — as 2025 data accumulates, check alignment
 
-    ### For Policy Decisions
+    #### Don't:
+    1. **Don't extrapolate to Staten Island** or uncovered areas
+    2. **Don't treat absolute numbers as precise** — treat as ±15-20% estimates
+    3. **Don't assume Brooklyn/Queens predictions are equally reliable** as Manhattan
+    4. **Don't use for individual crash prediction** — this is an aggregate rate model
 
-    - These predictions are best used for **relative comparisons** (e.g., "10% more exposure → ~10% more crashes")
-    - **Absolute numbers** should be treated as rough estimates with ±15-20% uncertainty
-    - Consider these predictions as one input among many for infrastructure planning
+    ### For Policy & Infrastructure Decisions
+
+    - Use as **one input among many** for bike lane planning
+    - Predictions are best for **high-exposure areas** (Midtown, Downtown Brooklyn)
+    - Consider pairing with actual crash data for final decisions
+    - The model identifies **relative risk**, not causal mechanisms
     """)
 
 with st.expander("Why Grid-Level Modeling? (Grid vs. Borough)"):
@@ -1315,14 +1428,14 @@ with st.expander("Why Grid-Level Modeling? (Grid vs. Borough)"):
     > in cycling activity (seasonal, monthly patterns). The *spatial distribution* within a borough
     > is assumed to follow CitiBike station density—plausible since infrastructure follows demand.
 
-    **4. Exposure as Offset**
-    > In the GLM, log(exposure) is an offset. We model the *rate* (crashes per exposure-minute),
-    > not absolute counts. Even if absolute exposure estimates are biased, the rate remains valid
-    > if the bias is spatially constant within each borough.
+    **4. Exposure as Feature (not Offset)**
+    > Exposure is modeled as a feature: `log1p(exposure_min)` with estimated coefficient β.
+    > This allows: (1) including hours with exposure=0, (2) estimating the exposure elasticity.
+    > With β ≈ 0.42, we have diminishing returns: doubling exposure → ~34% more crashes.
 
     **5. Out-of-Sample Validation**
-    > The model predicts ~5,300 crashes for 2025; observed (in-cell) were ~5,474.
-    > This 3% error suggests the spatial proxy assumption is reasonable.
+    > The model now predicts for ALL hours in model cells (not just hours with exposure).
+    > This enables direct comparison with all observed crashes.
 
     ### Key Assumption
     > **Within a borough, CitiBike station density ≈ total cyclist density.**
@@ -1331,39 +1444,63 @@ with st.expander("Why Grid-Level Modeling? (Grid vs. Borough)"):
 
 with st.expander("Technical Details: Model Specification"):
     st.markdown("""
-    ### GLM Specification
+    ### GLM Specification (Daily Aggregation)
 
-    **Model Family:** Negative Binomial (accounts for overdispersion)
+    **Model Family:** Poisson (dispersion ~1 confirms no overdispersion)
 
-    **Formula:**
+    **Formula (DAILY - no hour_of_day):**
     ```
-    y_bike ~ C(hour_of_day) + C(dow) + C(month)
+    y_bike ~ C(dow) + C(month)
            + lat_n + lng_n + lat_n² + lng_n² + lat_n×lng_n
-           + trend
            + temp + prcp + snow + wspd
-           + offset(log(exposure_min))
+           + trend
+           + log1p_exposure
 
     where:
       lat_n = (grid_lat - mean) / std   (normalized grid cell latitude)
       lng_n = (grid_lng - mean) / std   (normalized grid cell longitude)
+      trend = (day_ts - 2021-01-01).days / 365.25   (years since training start)
+      log1p_exposure = log(exposure_min + 1)   (handles exposure=0)
     ```
 
+    **Why Daily (not Hourly)?**
+    - Hourly: ~2.8M training rows → crashes on 8GB RAM machines
+    - Daily: ~117K training rows → runs smoothly
+    - Hour-of-day patterns shown in dashboard from raw hourly data
+
+    **Exposure as Feature (not Offset):**
+    - `log1p(exposure)` handles exposure=0 gracefully (log1p(0) = 0)
+    - Coefficient β is estimated from data (not fixed at 1)
+    - Typical β ≈ 0.4-0.5 (diminishing returns)
+
     **Key Components:**
-    - **Temporal effects:** Hour (24), Day-of-week (7), Month (12) as dummy-coded categorical variables
-    - **Spatial effects:** Z-score normalized lat/lng (lat_n, lng_n) with quadratic terms for smooth spatial surface.
-      Normalization required because raw coordinates have tiny variance (~0.15°) but large values (~40.7),
-      causing numerical instability in GLM matrix inversion
-    - **Trend:** Linear time trend (days since 2020-01-01) for declining crash rate
-    - **Weather:** temp, prcp, snow, wspd (z-scored from training data)
-    - **Offset:** log(exposure) so we model rate, not count
 
-    **Training:** 2020-2024 (temporal separation from test)
-    **Testing:** 2025 (true out-of-sample)
+    | Component | Description | Purpose |
+    |-----------|-------------|---------|
+    | `C(dow)` | 7 categorical dummies | Weekend vs weekday patterns |
+    | `C(month)` | 12 categorical dummies | Seasonal variation |
+    | `lat_n, lng_n` | Z-scored coordinates | Spatial trends (north-south, east-west) |
+    | `lat_n², lng_n²` | Quadratic terms | Allow for curved spatial surface |
+    | `lat_n×lng_n` | Interaction | Diagonal spatial patterns |
+    | `temp, prcp, snow, wspd` | Z-scored weather | Weather impact on crashes |
+    | `trend` | Years since 2021-01-01 | Temporal trend in crash rates |
+    | `log1p_exposure` | Exposure feature | Estimated coefficient |
 
-    **Uncertainty Quantification:**
-    - Monte Carlo simulation (S=50)
-    - Parameter uncertainty: Multivariate Normal sampling from coefficient covariance matrix
-    - Weather uncertainty: Bootstrap years for each 2025 day
+    **Evaluation Consistency:**
+    - Predictions only for cells with 2025 exposure (`cells_2025`)
+    - Observed crashes only counted in cells with 2025 exposure
+    - Ensures apples-to-apples comparison
+
+    **Training/Test Split:**
+    - Training: 2021-2024 (4 years, excludes COVID 2020)
+    - Testing: 2025 (true out-of-sample)
+    - Evaluation: Crashes in cells_2025 only
+
+    **Monte Carlo Uncertainty (S=1000):**
+    - Parameter: Sample β from N(β̂, Σ̂)
+    - Weather: Bootstrap entire years for 2025 (preserves autocorrelation)
+    - Exposure: Historical patterns from 2021-2025
+    - Growth: ±20% exposure growth factor
     """)
 
 

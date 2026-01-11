@@ -5,10 +5,27 @@ This directory contains the modeling logic for NYC Bike Crash Risk Prediction.
 ## Overview
 
 The model predicts bicycle crashes in NYC based on:
-- **CitiBike exposure** (ride minutes per cell/hour) as a proxy for cycling activity
+- **CitiBike exposure** (ride minutes per cell/day) as a proxy for cycling activity
 - **Spatial features** (grid cells)
-- **Temporal features** (hour, day of week, month)
+- **Temporal features** (day of week, month, trend)
 - **Weather** (temperature, precipitation, snow, wind speed)
+
+---
+
+## Model Architecture (Daily Aggregation)
+
+### Why Daily Instead of Hourly?
+
+The model uses **daily** aggregation for memory efficiency:
+
+| Aggregation | Training Rows | 2025 Rows | RAM Usage |
+|-------------|---------------|-----------|-----------|
+| Hourly | ~2.8M | ~560K | ~500 MB+ (crashes) |
+| **Daily** | **~117K** | **~23K** | **~20 MB** |
+
+This 24x reduction in data size allows the model to run on 8GB RAM machines without memory issues.
+
+**Important:** Hour-of-day patterns are still shown in the dashboard from raw hourly data. The model simply doesn't use hour-of-day as a predictor.
 
 ---
 
@@ -18,66 +35,49 @@ The model predicts bicycle crashes in NYC based on:
 
 We model risk **not** at exact coordinate level, but at **cell level**. This is intentional:
 
-1. **Aggregation**: Crashes are counted per cell → more stable estimates
+1. **Aggregation**: Crashes are counted per cell -> more stable estimates
 2. **Exposure matching**: CitiBike trips are also aggregated to cells
-3. **Interpretability**: "Risk in Midtown" instead of "Risk at 40.7589°N"
+3. **Interpretability**: "Risk in Midtown" instead of "Risk at 40.7589N"
 
 ### Grid Specification
 
 | Parameter | Value |
 |-----------|-------|
-| Cell size | 0.025° × 0.025° |
-| Real size | ~2.5 km × 2.5 km |
+| Cell size | 0.025 x 0.025 deg |
+| Real size | ~2.5 km x 2.5 km |
 | Active cells | ~64 (with CitiBike exposure) |
 
 ### The Binning Process
 
 ```
 Step 1: Raw Coordinates
-────────────────────────────
+------------------------
 Crash #1: (40.7589, -73.9851)
 Crash #2: (40.7612, -73.9823)
 Crash #3: (40.7801, -73.9654)
 
 Step 2: Grid Quantization
-────────────────────────────
+------------------------
 Formula: floor(coord / 0.025) * 0.025
 
 Crash #1: floor(40.7589 / 0.025) * 0.025 = 40.75
           floor(-73.9851 / 0.025) * 0.025 = -74.00
-          → Cell: (40.75, -74.00)
+          -> Cell: (40.75, -74.00)
 
 Crash #2: floor(40.7612 / 0.025) * 0.025 = 40.75
           floor(-73.9823 / 0.025) * 0.025 = -74.00
-          → Cell: (40.75, -74.00)  ← SAME CELL!
+          -> Cell: (40.75, -74.00)  <- SAME CELL!
 
 Crash #3: floor(40.7801 / 0.025) * 0.025 = 40.775
           floor(-73.9654 / 0.025) * 0.025 = -73.975
-          → Cell: (40.775, -73.975)
+          -> Cell: (40.775, -73.975)
 
-Step 3: Aggregation per Cell/Hour
-────────────────────────────
-| cell_id         | hour_ts          | grid_lat | grid_lng | y_bike |
-|-----------------|------------------|----------|----------|--------|
-| 40.75_-74.00    | 2024-01-15 14:00 | 40.75    | -74.00   | 2      |
-| 40.775_-73.975  | 2024-01-15 14:00 | 40.775   | -73.975  | 1      |
-```
-
-### Visualization
-
-```
-NYC Grid (simplified):
-┌───────┬───────┬───────┬───────┐
-│   0   │   0   │   0   │   0   │  ← Crash count per cell
-├───────┼───────┼───────┼───────┤
-│   0   │   1   │   0   │   0   │  ← Crash #3
-├───────┼───────┼───────┼───────┤
-│   0   │   2   │   0   │   0   │  ← Crash #1 & #2 (aggregated!)
-├───────┼───────┼───────┼───────┤
-│   0   │   0   │   0   │   0   │
-└───────┴───────┴───────┴───────┘
-        ↑
-    Each box = 2.5 km × 2.5 km
+Step 3: Aggregation per Cell/Day
+------------------------
+| cell_id         | day_ts     | grid_lat | grid_lng | y_bike |
+|-----------------|------------|----------|----------|--------|
+| 40.75_-74.00    | 2024-01-15 | 40.75    | -74.00   | 2      |
+| 40.775_-73.975  | 2024-01-15 | 40.775   | -73.975  | 1      |
 ```
 
 **Important:** Exact coordinates are lost. The model only knows which cell a crash occurred in, not where exactly within the cell.
@@ -89,8 +89,8 @@ NYC Grid (simplified):
 ### Problem
 
 Grid coordinates have very small variance:
-- `grid_lat` range: ~40.70 to ~40.85 (only 0.15°)
-- `grid_lng` range: ~-74.05 to ~-73.90 (only 0.15°)
+- `grid_lat` range: ~40.70 to ~40.85 (only 0.15 deg)
+- `grid_lng` range: ~-74.05 to ~-73.90 (only 0.15 deg)
 
 This can cause numerical issues in GLM fitting.
 
@@ -117,91 +117,142 @@ Normalization statistics are stored in `model_meta_bike_all.json` and reused for
 
 ---
 
-## Model Formula
+## Model Formula (Daily)
 
 ```
-y_bike ~ C(hour_of_day) + C(dow) + C(month)
-       + lat_n + lng_n + lat_n² + lng_n² + lat_n×lng_n
-       + trend
+y_bike ~ C(dow) + C(month)
+       + grid_lat_norm + grid_lng_norm + lat2 + lng2 + lat_lng
        + temp + prcp + snow + wspd
-       + offset(log(exposure_min))
+       + trend
+       + log1p_exposure
 
 where:
-  lat_n = (grid_lat - mean) / std   (normalized grid cell latitude)
-  lng_n = (grid_lng - mean) / std   (normalized grid cell longitude)
+  grid_lat_norm = (grid_lat - mean) / std   (normalized grid cell latitude)
+  grid_lng_norm = (grid_lng - mean) / std   (normalized grid cell longitude)
+  trend = (day_ts - 2021-01-01).days / 365.25   (years since training start)
+  log1p_exposure = log(exposure_min + 1)   (handles exposure=0)
 ```
 
-**Note:** All spatial terms use **normalized grid cell coordinates**, not raw crash coordinates.
+**Note:** The formula does NOT include `C(hour_of_day)` because we aggregate to daily level. Hour-of-day patterns are shown in the dashboard from raw hourly data.
+
+### Exposure as Feature (Not Offset)
+
+The exposure term is modeled as a **feature** rather than an offset. This has important advantages:
+
+| Aspect | Offset Approach | Feature Approach |
+|--------|-----------------|------------------|
+| Formula | `offset(log(exposure))` | `log1p_exposure` as feature |
+| Exposure=0 | Excluded (log(0) = -inf) | Included (log1p(0) = 0) |
+| Coefficient | Fixed at beta=1 | Estimated from data |
+| Training | Only crashes with exposure | ALL crashes |
+| Evaluation | Only hours with exposure | ALL hours |
+
+**Why log1p?** The transformation `log(exposure + 1)` handles zero exposure gracefully:
+- log1p(0) = 0 -> baseline crash rate without cycling exposure
+- log1p(100) = 4.6 -> effect of 100 minutes exposure
+
+**Interpretation:** The estimated beta coefficient determines the exposure elasticity:
+- beta < 1: Diminishing returns (doubling exposure less than doubles crashes)
+- beta = 1: Proportional relationship (same as offset)
+- beta > 1: Superproportional (doubling exposure more than doubles crashes)
 
 ### Components
 
 | Term | Description |
 |------|-------------|
-| `C(hour_of_day)` | 24 categorical effects for time of day |
 | `C(dow)` | 7 categorical effects for day of week |
 | `C(month)` | 12 categorical effects for month |
-| `lat_n`, `lng_n` | Linear spatial trends (normalized grid coordinates) |
-| `lat_n²`, `lng_n²` | Quadratic terms allowing curvature |
-| `lat_n×lng_n` | Interaction term allowing diagonal patterns |
-| `trend` | Linear time trend (days since 2020-01-01) |
+| `grid_lat_norm`, `grid_lng_norm` | Linear spatial trends (normalized grid coordinates) |
+| `lat2`, `lng2` | Quadratic terms allowing curvature |
+| `lat_lng` | Interaction term allowing diagonal patterns |
 | `temp`, `prcp`, `snow`, `wspd` | Weather effects (normalized) |
-| `offset(log(exposure_min))` | CitiBike exposure as offset |
+| `trend` | Temporal trend (years since 2021-01-01) |
+| `log1p_exposure` | CitiBike exposure as feature (estimated coefficient) |
 
 ### Model Type
 
-- **Family**: Negative Binomial (accounts for overdispersion)
+- **Family**: Poisson (dispersion ~1, no overdispersion)
 - **Link**: Log-link
-- **Interpretation**: Rate model → λ = exposure × exp(Xβ)
+- **Interpretation**: lambda = exp(X*beta) where X includes log1p(exposure)
+
+**Why Poisson (not Negative Binomial)?**
+The data shows a dispersion of ~1.002, indicating practically no overdispersion. A Poisson GLM is therefore sufficient and simpler to interpret than Negative Binomial.
+
+---
+
+## Evaluation Methodology
+
+### Cell Consistency
+
+**Critical:** Both predictions and observed crashes use the **same cell set**.
+
+The model uses `cells_2025` (cells that had CitiBike exposure in 2025) for:
+1. **Prediction**: Only predict for cells with 2025 exposure
+2. **Observed**: Only count crashes in cells with 2025 exposure
+
+This ensures an apples-to-apples comparison. Without this, the model would predict crashes for cells that had no 2025 exposure, inflating predictions.
+
+```
+cells_keep (training)     cells_2025 (evaluation)
+        64 cells    --->   ~60-64 cells (with 2025 exposure)
+```
+
+### Why This Matters for Insurance
+
+For insurance pricing, we want to answer:
+> "Given the areas where CitiBike operates in 2025, how many crashes do we expect?"
+
+This requires predicting only for areas with actual exposure, not historical areas that may no longer have CitiBike service.
 
 ---
 
 ## Data Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         INPUTS                                   │
-├─────────────────────────────────────────────────────────────────┤
-│  crashes_bike_clean.parquet     (crashes with coordinates)      │
-│  tripdata_2013_2025_clean.parquet (CitiBike trips)              │
-│  weather_hourly_openmeteo/      (hourly weather)                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    SPATIAL BINNING                               │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Crashes → Grid cells (0.025°)                               │
-│  2. Trips → Grid cells (0.025°)                                 │
-│  3. Aggregation per cell/hour                                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    FEATURE ENGINEERING                           │
-├─────────────────────────────────────────────────────────────────┤
-│  - Time features (hour, dow, month, trend)                      │
-│  - Spatial features (grid_lat_norm, grid_lng_norm, ...)         │
-│  - Weather features (temp, prcp, snow, wspd - normalized)       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    MODEL FITTING                                 │
-├─────────────────────────────────────────────────────────────────┤
-│  Training: 2020-2024 (temporal separation)                      │
-│  Test: 2025 (true out-of-sample)                                │
-│  Models: Poisson + Negative Binomial                            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    OUTPUTS                                       │
-├─────────────────────────────────────────────────────────────────┤
-│  model_meta_bike_all.json           (normalization, coeffs)     │
-│  model_comparison_bike_all.parquet  (AIC, dispersion)           │
-│  risk_mc_2025_totals_*.parquet      (Monte Carlo predictions)   │
-│  risk_eval_2025_monthly_*.parquet   (observed vs predicted)     │
-└─────────────────────────────────────────────────────────────────┘
++----------------------------------------------------------+
+|                         INPUTS                            |
++----------------------------------------------------------+
+|  crashes_bike_clean.parquet     (crashes with coordinates)|
+|  tripdata_2013_2025_clean.parquet (CitiBike trips)        |
+|  weather_hourly_openmeteo/      (hourly weather)          |
++----------------------------------------------------------+
+                              |
+                              v
++----------------------------------------------------------+
+|                    SPATIAL BINNING                        |
++----------------------------------------------------------+
+|  1. Crashes -> Grid cells (0.025 deg)                     |
+|  2. Trips -> Grid cells (0.025 deg)                       |
+|  3. Aggregation per cell/DAY                              |
++----------------------------------------------------------+
+                              |
+                              v
++----------------------------------------------------------+
+|                    FEATURE ENGINEERING                    |
++----------------------------------------------------------+
+|  - Time features (dow, month, trend)                      |
+|  - Spatial features (grid_lat_norm, grid_lng_norm, ...)   |
+|  - Weather features (temp, prcp, snow, wspd - normalized) |
++----------------------------------------------------------+
+                              |
+                              v
++----------------------------------------------------------+
+|                    MODEL FITTING                          |
++----------------------------------------------------------+
+|  Training: 2021-2024 (excludes COVID 2020)                |
+|  Test: 2025 (true out-of-sample)                          |
+|  Model: Poisson GLM                                       |
++----------------------------------------------------------+
+                              |
+                              v
++----------------------------------------------------------+
+|                    OUTPUTS                                |
++----------------------------------------------------------+
+|  model_meta_bike_all.json           (normalization stats) |
+|  model_comparison_bike_all.parquet  (AIC, dispersion)     |
+|  risk_mc_2025_totals_*.parquet      (Monte Carlo draws)   |
+|  risk_eval_2025_monthly_*.parquet   (observed vs pred)    |
++----------------------------------------------------------+
 ```
 
 ---
@@ -210,10 +261,10 @@ where:
 
 | Period | Usage |
 |--------|-------|
-| 2020-2024 | Training (5 years) |
+| 2021-2024 | Training (4 years, excludes COVID 2020) |
 | 2025 | Test (out-of-sample) |
 
-The model is trained **only** on 2020-2024 data. The 2025 predictions are true out-of-sample forecasts.
+The model is trained **only** on 2021-2024 data. The year 2020 is excluded due to anomalous patterns during COVID. The 2025 predictions are true out-of-sample forecasts.
 
 ---
 
@@ -221,10 +272,72 @@ The model is trained **only** on 2020-2024 data. The 2025 predictions are true o
 
 For uncertainty quantification:
 
-1. **50 simulations** per model/scenario
-2. **Weather bootstrap**: Random training year as weather proxy for 2025
-3. **Parameter uncertainty**: Sampling from estimated coefficient distribution
-4. **Exposure scenarios**: -10%, actual, +10%
+1. **S=1000 simulations** for robust uncertainty estimates
+2. **4 uncertainty dimensions**:
+   - **Weather bootstrap**: Random year (2021-2025) as weather scenario
+   - **Exposure year**: Historical exposure patterns (2021-2025) applied to 2025 grid
+   - **Growth factor**: Random factor in ±20% range (historically observed)
+   - **Parameter uncertainty**: Sampling from estimated coefficient distribution
+3. **Exposure scenarios**: -10%, actual, +10%
+
+**Exposure Scenario Interpretation:**
+When exposure_year != 2025, we apply historical usage patterns to the 2025 network.
+This answers: "What if the 2025 network had been used like in year X?"
+Cells that didn't exist in year X will have exposure=0.
+
+### Exposure Scenarios with Feature Approach
+
+With exposure as a feature (not offset), scenarios work non-linearly:
+
+```
+Scenario: +10% exposure
+------------------------
+1. Modify raw exposure: exposure_scenario = exposure * 1.10
+2. Recompute feature: log1p_exposure = log(exposure_scenario + 1)
+3. Predict: mu = exp(X*beta)
+
+Effect depends on:
+- Baseline exposure level
+- Estimated beta coefficient
+- Non-linear log1p transformation
+```
+
+**Example:** With beta=0.8 (diminishing returns):
+- Low exposure (10 min -> 11 min): +10% exposure -> ~+8% crashes
+- High exposure (100 min -> 110 min): +10% exposure -> ~+7% crashes
+
+This is more realistic than the offset approach where +10% exposure always means +10% crashes.
+
+---
+
+## Results Interpretation
+
+### 2025 Evaluation
+
+| Metric | Value |
+|--------|-------|
+| Observed (in model cells) | ~5,549 crashes |
+| Predicted (Poisson) | ~6,104 crashes |
+| Difference | ~+10% overprediction |
+
+### Possible Explanations for Overprediction
+
+1. **Reporting Delays (Nachmeldelücken)**: Late 2025 crashes (Nov/Dec) may not be fully reported yet as of early 2026.
+
+2. **2025 was an unusual year**: Total NYC crashes in 2025 (6,912) were below the 2021-2024 average (7,732):
+
+| Year | Total Crashes (NYC) |
+|------|---------------------|
+| 2021 | 7,854 |
+| 2022 | 7,883 |
+| 2023 | 7,959 |
+| 2024 | 7,231 |
+| **2025** | **6,912** |
+| Avg 2021-24 | 7,732 |
+
+The model, trained on 2021-2024, naturally predicts closer to historical averages.
+
+3. **Trend extrapolation**: The trend variable captures declining crash rates, but 2025 may have declined faster than the historical trend predicted.
 
 ---
 
@@ -232,7 +345,7 @@ For uncertainty quantification:
 
 | File | Description |
 |------|-------------|
-| `run_risk_modeling.py` | Main pipeline (data prep → modeling → evaluation) |
+| `run_risk_modeling.py` | Main pipeline (data prep -> modeling -> evaluation) |
 
 ## Usage
 

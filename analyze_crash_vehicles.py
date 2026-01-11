@@ -5,7 +5,7 @@ import duckdb
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent
-CRASH_FILE = PROJECT_ROOT / "data" / "interim" / "crashes.parquet"
+CRASH_FILE = PROJECT_ROOT / "data" / "raw" / "crashes" / "crashes.parquet"
 
 con = duckdb.connect()
 

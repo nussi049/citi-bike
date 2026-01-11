@@ -27,26 +27,27 @@ col1, col2 = st.columns(2)
 with col1:
     st.markdown("""
     **Objective:**
-    Predict bike crash counts for NYC grid cells using a Negative Binomial GLM
-    with CitiBike exposure as offset.
+    Predict bike crash counts for NYC grid cells using a Poisson GLM
+    with CitiBike exposure as feature.
 
     **Key Features:**
-    - Temporal effects (hour, day-of-week, month)
+    - Temporal effects (day-of-week, month)
     - Spatial effects (lat/lng with quadratic terms)
     - Weather covariates (temperature, precipitation, wind)
     - Trend term for declining crash rate
+    - Exposure as feature (log1p) with estimated elasticity
     """)
 
 with col2:
     st.markdown("""
     **Validation:**
-    - Training: 2020-2024 (temporal separation)
+    - Training: 2021-2024 (excludes COVID 2020)
     - Testing: 2025 (true out-of-sample)
     - Proxy validation: CitiBike vs. bike counters (r ≈ 0.85)
 
     **Uncertainty:**
-    - Monte Carlo simulation (S=50)
-    - Parameter + weather uncertainty
+    - Monte Carlo simulation (S=1000)
+    - 4 dimensions: weather, exposure year, growth (±20%), parameters
     - Exposure scenarios (±10%)
     """)
 
@@ -71,19 +72,19 @@ with st.expander("Data Pipeline Overview", expanded=False):
     ├── Clean trips → exposure_cell_hour.parquet
     ├── Clean crashes → crash_cell_hour.parquet
     ├── Proxy validation (Borough × Month correlation)
-    └── Grid training data (2020-2024)
+    └── Grid training data (2021-2024)
                         │
                         ▼
     Modeling
-    ├── Poisson GLM (baseline)
-    ├── Negative Binomial GLM (main model)
-    ├── Monte Carlo simulation (S=50)
+    ├── Poisson GLM (dispersion ~1)
+    ├── Monte Carlo simulation (S=1000)
+    ├── 4 uncertainty dimensions
     └── Exposure scenarios (±10%)
                         │
                         ▼
     Dashboard
     ├── Heatmaps (crashes, exposure, coverage)
-    ├── Model comparison (Poisson vs. NegBin)
+    ├── Poisson model diagnostics
     ├── 2025 forecast vs. observed
     ├── Uncertainty quantification
     └── Proxy quality analysis
