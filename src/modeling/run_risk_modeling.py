@@ -117,12 +117,7 @@ con.execute(f"PRAGMA temp_directory='{TMP_DIR.as_posix()}';")
 # Forcing rebuild prevents "same fit" due to cached files.
 FORCE_REBUILD = True
 
-# Cell selection strategy: keep cells covering X% of total CRASHES (not exposure!)
-# Exposure-based selection was problematic: 80% exposure = only 37% crashes
-# Crash-based selection ensures we cover most crashes:
-#   80% crash coverage = ~50 cells (manageable for GLM)
-#   90% crash coverage = ~77 cells (may cause OOM)
-CRASH_COVERAGE = 1.00   # Target ALL cells with CitiBike exposure (~140 cells, ~94% crashes)
+CRASH_COVERAGE = 1.00   # Target ALL cells with CitiBike exposure
 
 print("DuckDB:", DB_PATH)
 print("GRID_DEG:", GRID_DEG, "| FORCE_REBUILD:", FORCE_REBUILD, "| CRASH_COVERAGE:", CRASH_COVERAGE)
@@ -572,7 +567,6 @@ if FORCE_REBUILD:
 
 # 1) Determine cells covering CRASH_COVERAGE of total CRASHES (TRAINING DATA ONLY)
 # NOTE: We select by CRASH count, not exposure! This ensures we cover most crashes.
-# Exposure-based selection was problematic: 80% exposure = only 37% crashes
 con.execute(f"""
 COPY (
   WITH cell_crashes AS (
