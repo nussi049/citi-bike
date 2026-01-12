@@ -59,7 +59,7 @@ TRIPS_BOROUGH_HOUR = MART_DIR / "trips_borough_hour.parquet"
 RISK_DIR = PROCESSED_DIR / "risk_hourly_mc"
 
 # Training data: grid cell × hour with features
-GRID_TRAIN = RISK_DIR / "grid_train_cell_hour_2020_2024.parquet"
+GRID_TRAIN = RISK_DIR / "grid_train_cell_hour_2021_2024.parquet"
 
 # Model evaluation: monthly observed vs predicted for 2025
 EVAL_2025 = RISK_DIR / "risk_eval_2025_monthly_bike_all.parquet"
@@ -72,11 +72,11 @@ COMP = RISK_DIR / "model_comparison_bike_all.parquet"
 
 # Crash and exposure data at cell × hour level
 CRASH_CELL_HOUR = RISK_DIR / "crash_cell_hour.parquet"
-EXPOSURE_CELL_HOUR_TRAIN = RISK_DIR / "exposure_cell_hour_2020_2024.parquet"
+EXPOSURE_CELL_HOUR_TRAIN = RISK_DIR / "exposure_cell_hour_2021_2024.parquet"
 EXPOSURE_CELL_HOUR_TEST = RISK_DIR / "exposure_cell_hour_2025.parquet"
 
 # Grid cells included in model (cells with sufficient exposure)
-CELLS_KEEP = RISK_DIR / "grid_cells_keep_2020_2024.parquet"
+CELLS_KEEP = RISK_DIR / "grid_cells_keep_2021_2024.parquet"
 
 # Monte Carlo simulation results with scenarios
 MC_2025_SCENARIOS = RISK_DIR / "risk_mc_2025_totals_bike_all_scenarios.parquet"

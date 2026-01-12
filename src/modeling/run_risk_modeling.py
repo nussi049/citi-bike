@@ -17,10 +17,10 @@ INPUTS:
 
 OUTPUTS (used by dashboard):
     - crash_cell_hour.parquet              Crashes binned to grid cells
-    - exposure_cell_hour_2020_2024.parquet Training exposure
+    - exposure_cell_hour_2021_2024.parquet Training exposure
     - exposure_cell_hour_2025.parquet      Test exposure
-    - grid_train_cell_hour_2020_2024.parquet Training mart with features
-    - grid_cells_keep_2020_2024.parquet    Cells included in model
+    - grid_train_cell_hour_2021_2024.parquet Training mart with features
+    - grid_cells_keep_2021_2024.parquet    Cells included in model
     - grid_2025_cell_hour_bike_all.parquet 2025 test mart
     - model_meta_bike_all.json             Normalization stats, formula
     - model_comparison_bike_all.parquet    AIC, dispersion, quantiles
@@ -223,7 +223,7 @@ if crash_check['n'].iloc[0] == 0:
 
 
 # Separate exposure paths for train and test to prevent leakage
-exposure_train_path = OUT_DIR / "exposure_cell_hour_2020_2024.parquet"
+exposure_train_path = OUT_DIR / "exposure_cell_hour_2021_2024.parquet"
 exposure_test_path = OUT_DIR / "exposure_cell_hour_2025.parquet"
 
 if FORCE_REBUILD:
@@ -556,9 +556,9 @@ print("weather range:", con.execute("SELECT MIN(hour_ts), MAX(hour_ts) FROM weat
 # Two separate grids:
 # 1. Daily grid for GLM training (memory-efficient: ~117K rows)
 # 2. Hourly grid for dashboard analysis (kept for hour-of-day patterns)
-grid_train_day_path = OUT_DIR / "grid_train_cell_day_2020_2024.parquet"  # For GLM
-grid_train_hour_path = OUT_DIR / "grid_train_cell_hour_2020_2024.parquet"  # For Dashboard
-cells_keep_path = OUT_DIR / "grid_cells_keep_2020_2024.parquet"
+grid_train_day_path = OUT_DIR / "grid_train_cell_day_2021_2024.parquet"  # For GLM
+grid_train_hour_path = OUT_DIR / "grid_train_cell_hour_2021_2024.parquet"  # For Dashboard
+cells_keep_path = OUT_DIR / "grid_cells_keep_2021_2024.parquet"
 
 if FORCE_REBUILD:
     if grid_train_day_path.exists(): grid_train_day_path.unlink()
