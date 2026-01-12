@@ -1,6 +1,43 @@
+import os
 import streamlit as st
 
 st.set_page_config(page_title="Citi Bike Risk Dashboard", layout="wide")
+
+# =============================================================================
+# PASSWORD PROTECTION (optional)
+# Set DASHBOARD_PASSWORD environment variable to enable
+#
+# NOTE: This is a simple protection for the coding challenge demo.
+# NOT brute-force resistant - no rate limiting, no account lockout.
+# For production use: implement proper auth (OAuth, SSO, etc.)
+# =============================================================================
+def check_password() -> bool:
+    """Returns True if no password set or user authenticated."""
+    password = os.environ.get("DASHBOARD_PASSWORD")
+    if not password:
+        return True
+
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    st.title("NYC Bike Crash Dashboard")
+    st.markdown("---")
+
+    with st.form("login"):
+        pwd = st.text_input("Password", type="password")
+        if st.form_submit_button("Login"):
+            if pwd == password:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password")
+    return False
+
+if not check_password():
+    st.stop()
 
 st.title("Citi Bike — Trips, Crashes, Risk & Exposure")
 
