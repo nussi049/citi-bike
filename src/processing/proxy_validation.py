@@ -58,8 +58,8 @@ OUT_DIR = PROCESSED_DIR / "proxy_test"
 PROXY_DATASET_PATH = OUT_DIR / "proxy_test_borough_month.parquet"
 
 # Validation window (should match training period)
-START = "2020-01-01"
-END_EXCL = "2024-12-31"
+START = "2021-01-01"
+END_EXCL = "2025-01-01"
 
 # Grid size for spatial aggregation (degrees, ~2.5km)
 GRID_DEG = 0.025
@@ -304,13 +304,13 @@ def compute_correlation(df: pd.DataFrame) -> pd.DataFrame:
     # Interpretation
     print(f"\nInterpretation:")
     if pearson.statistic > 0.8:
-        print(f"  ✓ Strong correlation (r = {pearson.statistic:.2f})")
+        print(f"  Strong correlation (r = {pearson.statistic:.2f})")
         print(f"    CitiBike is a VALID temporal proxy for cycling activity.")
     elif pearson.statistic > 0.6:
-        print(f"  ~ Moderate correlation (r = {pearson.statistic:.2f})")
+        print(f"  Moderate correlation (r = {pearson.statistic:.2f})")
         print(f"    CitiBike provides REASONABLE temporal proxy with some noise.")
     else:
-        print(f"  ✗ Weak correlation (r = {pearson.statistic:.2f})")
+        print(f"  Weak correlation (r = {pearson.statistic:.2f})")
         print(f"    CitiBike may NOT be a reliable proxy for total cycling.")
 
     # Stability by borough

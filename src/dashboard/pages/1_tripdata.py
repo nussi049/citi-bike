@@ -151,7 +151,7 @@ if show_trips and show_exposure:
     ).properties(height=320)
     
     st.altair_chart(chart_ts, use_container_width=True)
-    st.caption("📊 **Blue (left axis):** Trips | **Orange (right axis):** Exposure minutes")
+    st.caption("Note: **Blue (left axis):** Trips | **Orange (right axis):** Exposure minutes")
 
 elif show_trips:
     # Single Y-axis: Trips only
@@ -235,7 +235,7 @@ if show_trips and show_exposure:
     ).properties(height=320)
     
     st.altair_chart(chart_hod, use_container_width=True)
-    st.caption("📊 **Blue (left axis):** Trips | **Orange (right axis):** Exposure minutes")
+    st.caption("Note: **Blue (left axis):** Trips | **Orange (right axis):** Exposure minutes")
 
 elif show_trips:
     # Single Y-axis: Trips only
@@ -350,7 +350,7 @@ with col_left:
         ).properties(height=280)
         
         st.altair_chart(chart_dow, use_container_width=True)
-        st.caption("📊 **Blue (left):** Trips | **Orange (right):** Exposure")
+        st.caption("Note: **Blue (left):** Trips | **Orange (right):** Exposure")
 
     elif show_trips:
         # Single Y-axis: Trips only
@@ -423,7 +423,7 @@ with col_right:
         ).properties(height=280)
         
         st.altair_chart(chart_hod_dow, use_container_width=True)
-        st.caption("📊 **Solid:** Trips (left) | **Dashed:** Exposure (right)")
+        st.caption("Note: **Solid:** Trips (left) | **Dashed:** Exposure (right)")
     
     elif show_trips:
         chart_hod_dow = (
@@ -536,7 +536,7 @@ with col_left:
         ).properties(height=280)
         
         st.altair_chart(chart_mix, use_container_width=True)
-        st.caption("📊 **Solid:** Trips (left) | **Dashed:** Exposure (right)")
+        st.caption("Note: **Solid:** Trips (left) | **Dashed:** Exposure (right)")
     
     elif show_trips:
         chart_mix = (
@@ -774,7 +774,7 @@ else:
                     ).properties(height=280)
                     
                     st.altair_chart(chart_temp, use_container_width=True)
-                    st.caption("📊 **Blue (left):** Trips | **Orange (right):** Exposure")
+                    st.caption("Note: **Blue (left):** Trips | **Orange (right):** Exposure")
                     
                 elif show_trips:
                     chart_temp = (

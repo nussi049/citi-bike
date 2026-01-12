@@ -128,7 +128,7 @@ def load_complete_grid_data():
 # ============================================================================
 # SIDEBAR - FILTERS (Load grid data EARLY to detect years)
 # ============================================================================
-st.sidebar.header("🔍 Filters")
+st.sidebar.header("Filters")
 
 # Load COMPLETE grid data early
 grid_complete = load_complete_grid_data()
@@ -149,7 +149,7 @@ def get_available_years(grid_df):
 
 available_years = get_available_years(grid_complete)
 
-st.sidebar.info(f"📊 Available years: **{min(available_years)}-{max(available_years)}**")
+st.sidebar.info(f"Available years: **{min(available_years)}-{max(available_years)}**")
 
 selected_years = st.sidebar.multiselect(
     "Select Years",
@@ -159,16 +159,16 @@ selected_years = st.sidebar.multiselect(
 )
 
 if len(selected_years) == 0:
-    st.sidebar.warning("⚠️ Please select at least one year")
+    st.sidebar.warning("Please select at least one year")
     selected_years = available_years
 
-st.sidebar.success(f"✅ Selected: **{min(selected_years)}-{max(selected_years)}**")
+st.sidebar.success(f"Selected: **{min(selected_years)}-{max(selected_years)}**")
 
 year_range_str = f"{min(selected_years)}-{max(selected_years)}" if len(selected_years) > 1 else str(selected_years[0])
 
 
 # =============================
-# F) SPATIAL HEATMAPS - COMPLETE DATA 2020-2025
+# F) SPATIAL HEATMAPS
 # =============================
 st.subheader(f"Spatial Distribution: NYC Heatmaps ({year_range_str})")
 
@@ -202,7 +202,7 @@ if BOROUGH_GEOJSON.exists():
     
     borough_boundaries = extract_borough_boundaries(borough_geojson)
 else:
-    st.error(f"❌ GeoJSON not found at: {BOROUGH_GEOJSON}")
+    st.error(f"GeoJSON not found at: {BOROUGH_GEOJSON}")
     borough_boundaries = []
 
 if grid_complete.empty:
@@ -211,9 +211,13 @@ else:
     st.markdown(f"""
     **2D Maps of New York City showing:**
     - Grid cells colored by intensity (darker = higher values)
-    - **Real NYC Borough boundaries** overlaid
-    - **Time period: {year_range_str}**
-    - **Note:** CitiBike exposure is only a proxy for total bike activity (see Model Limitations below)
+    - Time period: {year_range_str}
+    - Grid cells: 2.5km × 2.5km (GRID_DEG=0.025)
+    - Black lines: Real NYC Borough boundaries
+    - Crashes Tab: All crashes (incl. areas without CitiBike)
+    - Exposure Tab: Only CitiBike coverage areas
+    - Coverage Tab: Model grid + bike counter locations
+    - Important: CitiBike exposure is a proxy for total bike activity—not all bike trips!
     """)
     
     # ============================================================================
@@ -227,7 +231,7 @@ else:
         
         total_crashes = grid_filtered['y_bike'].sum()
     else:
-        st.warning("⚠️ No timestamp column found - showing all data")
+        st.warning("No timestamp column found - showing all data")
     
     # Prepare heatmap data
     @st.cache_data
@@ -323,7 +327,7 @@ else:
             return m
         
         # Create tabs for 3 maps
-        tab1, tab2, tab3 = st.tabs(["🚨 Crashes", "🚴 Exposure", "📍 Coverage & Counters"])
+        tab1, tab2, tab3 = st.tabs(["Crashes", "Exposure", "Coverage & Counters"])
 
         # TAB 1: CRASHES MAP
         with tab1:
@@ -568,8 +572,8 @@ else:
 
                 st.markdown("""
                 **Legend:**
-                - 🟩 **Green rectangles**: Grid cells included in the model (have CitiBike exposure)
-                - 🔴🔵🟢🟣 **Colored circles**: Bike counter stations (size = total bikes counted, color = borough)
+                - **Green rectangles**: Grid cells included in the model (have CitiBike exposure)
+                - **Colored circles**: Bike counter stations (size = total bikes counted, color = borough)
 
                 **Key Insight:** Counter size shows measurement volume. Larger counters provide more reliable proxy validation.
                 """)
@@ -584,17 +588,6 @@ else:
             show slightly more grid cells in outer areas compared to other years. The effect on the model is negligible.
             """)
 
-        st.caption(f"""
-        **Map Details:**
-        - Grid cells: 2.5km × 2.5km (GRID_DEG=0.025)
-        - Black lines: **Real NYC Borough boundaries**
-        - **Time period: {year_range_str}**
-        - **Crashes Tab:** All crashes (incl. areas without CitiBike)
-        - **Exposure Tab:** Only CitiBike coverage areas
-        - **Coverage Tab:** Model grid + bike counter locations
-        - **Important:** CitiBike exposure is a proxy for total bike activity—not all bike trips!
-        - Click on grid cells/markers for details
-        """)
 
 
 # =============================
@@ -640,25 +633,37 @@ train = train[train["exposure_min"] > 0].copy()
 # =============================
 st.subheader("A) High-level summary (training 2021–2024, forecast 2025)")
 
-# FIXED: Use grid_complete for ACTUAL crash/exposure totals (consistent with maps)
-if not grid_complete.empty:
-    grid_2021_2024 = grid_complete[
-        (grid_complete['hour_ts'] >= '2021-01-01') &
-        (grid_complete['hour_ts'] < '2025-01-01')
-    ].copy()
-    
-    # Total observed crashes (ALL areas, including non-CitiBike)
-    obs_train_total = float(grid_2021_2024['y_bike'].sum())
+# Use cells_2025 filter for consistency with historical table below
+cells_2025_path = CELLS_KEEP.parent / "grid_cells_2025.parquet"
+if cells_2025_path.exists():
+    cells_2025_df = pd.read_parquet(cells_2025_path)
+    active_cells_kpi = set(cells_2025_df['cell_id'].tolist())
 
-    # Total exposure (only CitiBike areas)
-    exp_train_total = float(grid_2021_2024[grid_2021_2024['exposure_min'] > 0]['exposure_min'].sum())
+    # Load exposure and crashes separately (same as historical table)
+    exposure_train = pd.read_parquet(EXPOSURE_CELL_HOUR_TRAIN)
+    exposure_train['hour_ts'] = pd.to_datetime(exposure_train['hour_ts'])
+    exp_2021_2024 = exposure_train[
+        (exposure_train['hour_ts'] >= '2021-01-01') &
+        (exposure_train['hour_ts'] < '2025-01-01') &
+        (exposure_train['cell_id'].isin(active_cells_kpi))
+    ]
 
-    # Rate calculated on CitiBike areas only
-    crashes_with_exposure = grid_2021_2024[grid_2021_2024['exposure_min'] > 0]
-    train_rate = rate_per_100k(
-        float(crashes_with_exposure['y_bike'].sum()),
-        float(crashes_with_exposure['exposure_min'].sum())
-    )
+    crashes_all = pd.read_parquet(CRASH_CELL_HOUR)
+    crashes_all['hour_ts'] = pd.to_datetime(crashes_all['hour_ts'])
+    crashes_2021_2024 = crashes_all[
+        (crashes_all['hour_ts'] >= '2021-01-01') &
+        (crashes_all['hour_ts'] < '2025-01-01') &
+        (crashes_all['cell_id'].isin(active_cells_kpi))
+    ]
+
+    # Total observed crashes in 2025-active cells (ALL crashes, not just hours with exposure)
+    obs_train_total = float(crashes_2021_2024['y_bike'].sum())
+
+    # Total exposure in 2025-active cells
+    exp_train_total = float(exp_2021_2024['exposure_min'].sum())
+
+    # Rate: crashes / exposure (consistent with historical table)
+    train_rate = rate_per_100k(obs_train_total, exp_train_total)
 else:
     obs_train_total = exp_train_total = train_rate = float('nan')
 
@@ -674,7 +679,7 @@ pred_poisson = float(pred_2025.loc[pred_2025["model"] == "poisson", "pred_total_
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Observed bike crashes (2021–2024)", fmt_int(obs_train_total))
 c2.metric("Exposure minutes (2021–2024)", fmt_int(exp_train_total))
-c3.metric("Rate per 100k exposure-min (train)", fmt_float(train_rate, 3))
+c3.metric("Rate per 100k exposure-min (2021-2024)", fmt_float(train_rate, 3))
 c4.metric("Observed bike crashes (2025)", fmt_int(obs_2025_total))
 
 c5, _ = st.columns(2)
@@ -690,20 +695,32 @@ st.markdown("---")
 st.subheader("A) Model Methodology & Historical Analysis")
 
 st.markdown("""
-#### Daily Aggregation (Memory Efficient)
+#### CitiBike as Proxy for Total Cycling Activity
 
-The model uses **daily** data (~117K rows) instead of hourly (~2.8M rows) for memory efficiency.
-This allows running on 8GB RAM machines. Hour-of-day patterns are shown below from raw hourly data.
+The model uses CitiBike trip data as a proxy for overall cycling activity in NYC. This assumption is
+partially validated in **Section F** (Borough × Month correlation r ≈ 0.85 with bike counter data).
+
+#### Daily Aggregation
+
+The model operates on **daily** aggregated data (~117K rows) rather than hourly (~2.8M rows) for computational efficiency.
 
 #### Evaluation Consistency
 
-**Critical:** Predictions and observed crashes use the **same cell set** (cells with 2025 exposure).
+Predictions and observed crashes use the **same spatial footprint** (cells_2025):
 
-- **Prediction**: Only for cells that had CitiBike activity in 2025
-- **Observed**: Only crashes in cells with 2025 CitiBike exposure
+| | Definition |
+|---|---|
+| **cells_2025** | Grid cells where at least one CitiBike trip passed through in 2025 |
+| **Prediction** | Model predicts for ALL days in cells_2025 (including days without exposure) |
+| **Observed** | ALL crashes in cells_2025 (regardless of whether exposure existed on that day) |
 
-This ensures an apples-to-apples comparison for insurance use cases:
+This ensures an apples-to-apples comparison: 
 > "Given the areas where CitiBike operates in 2025, how many crashes do we expect?"
+
+#### Forecasting Future Years
+> For true forecasting, a **prospective active network** must be assumed (e.g., using cells from prior years),
+since the future spatial coverage cannot be known in advance. In practice, the CitiBike network footprint
+has remained highly stable over recent years.
 """)
 
 # =============================
@@ -808,8 +825,8 @@ within boroughs is assumed, not validated.
 
 #### Key Limitations
 
-1. **Spatial gaps:** ~7% of NYC crashes occur outside model coverage (Staten Island, outer areas)
-2. **Proxy drift:** CitiBike grows faster than total cycling in Brooklyn/Queens
+1. **Spatial gaps:** Many NYC crashes occur outside model coverage (Staten Island, outer areas)
+2. **Proxy drift:** CitiBike grows faster than total cycling (~15% vs ~5% annually in Brooklyn/Queens). This shifting scaling factor means the observed crash rate decrease may partially reflect proxy drift rather than actual safety improvements.
 3. **Reporting delays:** Recent crashes may not be fully reported
 
 ---
@@ -831,19 +848,11 @@ if "dispersion" in comp_show.columns:
 
 st.dataframe(comp_show, use_container_width=True)
 
-st.markdown("""
-**Model Selection:** Poisson GLM (Negative Binomial removed - dispersion ~1 indicates no overdispersion)
-
-**Key metrics:**
-- **Dispersion (Pearson χ²/df):** Values near 1 indicate good fit. Our value ~1.002 confirms Poisson is appropriate.
-- **AIC:** Lower is better for model comparison.
-""")
-
 
 # =============================
 # C) Forecast 2025 vs observed
 # =============================
-st.subheader("C) Forecast 2025 vs observed (monthly totals)")
+st.subheader("C) Backtest 2025 vs observed (monthly totals)")
 
 plot_df = eval_2025.copy()
 plot_df["month_ts"] = pd.to_datetime(plot_df["month_ts"])
@@ -1156,7 +1165,7 @@ else:
 
         chart = (scatter + regression).properties(
             height=350,
-            title=f'Pearson r = {overall_r:.3f} (p < 0.001) — {len(scatter_df)} data points'
+            title=f'Pearson r = {overall_r:.3f} (p < 0.001)'
         )
         st.altair_chart(chart, use_container_width=True)
 
@@ -1253,7 +1262,7 @@ else:
                 """)
 
     # Expander with methodology details
-    with st.expander("📊 Proxy Validation Methodology Details"):
+    with st.expander("Proxy Validation Methodology Details"):
         st.markdown("""
         ### How Proxy Validation Works
 
@@ -1277,7 +1286,7 @@ else:
 
         **Limitations of This Validation:**
         1. **Spatial mismatch**: Counters are on bridges/paths, not at CitiBike stations
-        2. **Few data points**: Only 5 boroughs × ~60 months ≈ 300 points max
+        2. **Few data points**: Only 4 boroughs × ~48 months
         3. **Different cyclist populations**: Commuters (counters) vs. short trips (CitiBike)
         4. **No grid-level validation**: We can't validate that the exposure *distribution* is correct
 
@@ -1300,20 +1309,6 @@ st.markdown("""
 This section documents key methodological choices and their implications for interpretation.
 """)
 
-# --- Training/Evaluation Consistency ---
-with st.expander("Training/Evaluation Consistency (Updated)", expanded=True):
-    st.markdown("""
-    #### Exposure as Feature: Full Grid Coverage
-
-    With exposure modeled as a **feature** (not offset), the model now covers ALL hours:
-
-    - **Training:** Complete grid (cell × hour) with exposure=0 where no CitiBike trips
-    - **Prediction:** For ALL hours, including exposure=0 (log1p(0) = 0)
-    - **Evaluation:** Against ALL crashes in model cells
-
-    **Key insight:** The model learns a baseline crash rate even without CitiBike exposure.
-    The `log1p_exposure` coefficient (β ≈ 0.42) captures how exposure increases crash risk.
-    """)
 
 # --- Proxy Limitations ---
 with st.expander("CitiBike as Cycling Proxy: Strengths & Weaknesses", expanded=True):
@@ -1346,7 +1341,7 @@ with st.expander("CitiBike as Cycling Proxy: Strengths & Weaknesses", expanded=T
         **Spatial Gaps:**
         - Staten Island: 0% coverage (no CitiBike)
         - Outer Bronx/Queens: limited coverage
-        - ~21% of NYC crashes in uncovered areas
+        - Many NYC crashes in uncovered areas
 
         **Temporal Gaps:**
         - Night hours (2-5 AM): minimal CitiBike activity
@@ -1365,7 +1360,7 @@ with st.expander("Uncertainty Quantification: What's Captured & What's Not"):
     - **Growth uncertainty:** ±20% exposure growth factor
 
     **Uncertainty Sources NOT CAPTURED:**
-    - **Proxy drift:** CitiBike share of cycling may change over time
+    - **Proxy drift:** CitiBike grows faster than total cycling, so the crash-per-exposure rate may appear to decrease even if actual safety is unchanged
     - **Model misspecification:** Functional form may be wrong
     - **Spatial coverage gaps:** No uncertainty for areas without CitiBike
     - **External shocks:** COVID recovery, e-bike adoption, infrastructure changes
@@ -1374,44 +1369,20 @@ with st.expander("Uncertainty Quantification: What's Captured & What's Not"):
     For policy decisions, add ±10-15% to the reported intervals.
     """)
 
-# --- Recommendations ---
-with st.expander("Recommendations for Interpretation"):
-    st.markdown("""
-    ### How to Use These Predictions
-
-    #### Do:
-    1. **Use confidence intervals**, not point estimates
-    2. **Focus on Manhattan** — proxy quality is highest here
-    3. **Use for relative comparisons** — "10% more exposure → ~10% more crashes"
-    4. **Validate against actuals** — as 2025 data accumulates, check alignment
-
-    #### Don't:
-    1. **Don't extrapolate to Staten Island** or uncovered areas
-    2. **Don't treat absolute numbers as precise** — treat as ±15-20% estimates
-    3. **Don't assume Brooklyn/Queens predictions are equally reliable** as Manhattan
-    4. **Don't use for individual crash prediction** — this is an aggregate rate model
-
-    ### For Policy & Infrastructure Decisions
-
-    - Use as **one input among many** for bike lane planning
-    - Predictions are best for **high-exposure areas** (Midtown, Downtown Brooklyn)
-    - Consider pairing with actual crash data for final decisions
-    - The model identifies **relative risk**, not causal mechanisms
-    """)
 
 with st.expander("Why Grid-Level Modeling? (Grid vs. Borough)"):
     st.markdown("""
-    ### Design Decision: Grid-Level (64 cells) vs. Borough-Level (5 units)
+    ### Design Decision: Grid-Level vs. Borough-Level
 
-    Both models would operate at **hourly resolution**. The only difference is **spatial granularity**:
+    Both models would operate at **daily resolution**. The only difference is **spatial granularity**:
 
     | Criterion | Borough Model | Grid Model (chosen) |
     |-----------|---------------|---------------------|
-    | Spatial units | 5 boroughs | 64 grid cells |
-    | Observations | 5 × 8760h × 5y ≈ 219k | 64 × 8760h × 5y ≈ 2.8M |
-    | Hotspot detection | ❌ No | ✅ Yes |
-    | Risk pricing granularity | ❌ Coarse | ✅ Fine |
-    | Proxy validation | ✅ Validated at same level | ⚠️ Finer than validation |
+    | Spatial units | 5 boroughs | Grid cells (varies by coverage) |
+    | Granularity | Coarse | Fine (~2.5km cells) |
+    | Hotspot detection | No | Yes |
+    | Risk pricing granularity | Coarse | Fine |
+    | Proxy validation | Validated at same level | Finer than validation |
 
     ### Why the Grid Model is Justified
 
@@ -1430,12 +1401,13 @@ with st.expander("Why Grid-Level Modeling? (Grid vs. Borough)"):
 
     **4. Exposure as Feature (not Offset)**
     > Exposure is modeled as a feature: `log1p(exposure_min)` with estimated coefficient β.
-    > This allows: (1) including hours with exposure=0, (2) estimating the exposure elasticity.
-    > With β ≈ 0.42, we have diminishing returns: doubling exposure → ~34% more crashes.
+    > This allows: (1) including days with exposure=0, (2) estimating the exposure elasticity.
+    > With β ≈ 0.15, we have strong diminishing returns: doubling exposure → only ~11% more crashes.
 
-    **5. Out-of-Sample Validation**
-    > The model now predicts for ALL hours in model cells (not just hours with exposure).
-    > This enables direct comparison with all observed crashes.
+    **5. Backtest Validation**
+    > The model predicts for ALL days in model cells (not just days with exposure).
+    > This enables direct comparison with all observed crashes in the CitiBike coverage area.
+    > Note: This is a backtest (not a true forecast) since 2025 exposure data is known.
 
     ### Key Assumption
     > **Within a borough, CitiBike station density ≈ total cyclist density.**
@@ -1448,7 +1420,7 @@ with st.expander("Technical Details: Model Specification"):
 
     **Model Family:** Poisson (dispersion ~1 confirms no overdispersion)
 
-    **Formula (DAILY - no hour_of_day):**
+    **Formula:**
     ```
     y_bike ~ C(dow) + C(month)
            + lat_n + lng_n + lat_n² + lng_n² + lat_n×lng_n
@@ -1464,14 +1436,12 @@ with st.expander("Technical Details: Model Specification"):
     ```
 
     **Why Daily (not Hourly)?**
-    - Hourly: ~2.8M training rows → crashes on 8GB RAM machines
-    - Daily: ~117K training rows → runs smoothly
-    - Hour-of-day patterns shown in dashboard from raw hourly data
+    - Using daily instead of hourly data is significantly more compute-efficient, reducing memory usage and runtimes without hurting model performance.
 
     **Exposure as Feature (not Offset):**
     - `log1p(exposure)` handles exposure=0 gracefully (log1p(0) = 0)
     - Coefficient β is estimated from data (not fixed at 1)
-    - Typical β ≈ 0.4-0.5 (diminishing returns)
+    - β ≈ 0.15 (diminishing returns)
 
     **Key Components:**
 
@@ -1485,22 +1455,7 @@ with st.expander("Technical Details: Model Specification"):
     | `temp, prcp, snow, wspd` | Z-scored weather | Weather impact on crashes |
     | `trend` | Years since 2021-01-01 | Temporal trend in crash rates |
     | `log1p_exposure` | Exposure feature | Estimated coefficient |
-
-    **Evaluation Consistency:**
-    - Predictions only for cells with 2025 exposure (`cells_2025`)
-    - Observed crashes only counted in cells with 2025 exposure
-    - Ensures apples-to-apples comparison
-
-    **Training/Test Split:**
-    - Training: 2021-2024 (4 years, excludes COVID 2020)
-    - Testing: 2025 (true out-of-sample)
-    - Evaluation: Crashes in cells_2025 only
-
-    **Monte Carlo Uncertainty (S=1000):**
-    - Parameter: Sample β from N(β̂, Σ̂)
-    - Weather: Bootstrap entire years for 2025 (preserves autocorrelation)
-    - Exposure: Historical patterns from 2021-2025
-    - Growth: ±20% exposure growth factor
+                
     """)
 
 

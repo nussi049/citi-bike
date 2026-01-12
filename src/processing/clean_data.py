@@ -17,7 +17,7 @@ OUTPUTS:
 METHODOLOGY:
     Trip Cleaning:
         - Remove trips < 60s (likely false starts) or > 6h (likely errors)
-        - Remove trips outside NYC bounding box [40.50-41.00, -74.30--73.50]
+        - Remove trips outside NYC bounding box (excludes Jersey City, keeps NYC proper)
 
     Crash Cleaning:
         - Filter to bicycle-related crashes only (vehicle type or cyclist injury)

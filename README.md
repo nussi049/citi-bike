@@ -30,7 +30,7 @@ A Poisson GLM that predicts bike crash risk:
 - Weather impact analysis (temperature, precipitation, snow)
 
 **Model:**
-- Spatial grid model: ~64 cells at daily resolution
+- Spatial grid model at daily resolution (~2.5km cells)
 - Exposure as feature (not offset): crash rate with estimated elasticity
 - Monte Carlo uncertainty quantification (S=1000) with 4 uncertainty dimensions:
   - Weather bootstrap (2021-2025)
@@ -232,7 +232,7 @@ See [src/modeling/README.md](src/modeling/README.md) for detailed model document
 ## Results
 
 - **Training Period**: 2021-2024 (4 years, daily aggregation, excludes COVID 2020)
-- **Test Period**: 2025 (out-of-sample)
+- **Backtest Period**: 2025 (using known exposure data)
 - **Model**: Poisson GLM (dispersion ~1, no overdispersion)
 - **Prediction**: ~6,100 crashes (Predicted) vs ~5,550 crashes (Observed in model cells)
 

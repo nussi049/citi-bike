@@ -42,13 +42,12 @@ with col2:
     st.markdown("""
     **Validation:**
     - Training: 2021-2024 (excludes COVID 2020)
-    - Testing: 2025 (true out-of-sample)
+    - Backtest: 2025 (using known exposure)
     - Proxy validation: CitiBike vs. bike counters (r ≈ 0.85)
 
     **Uncertainty:**
     - Monte Carlo simulation (S=1000)
     - 4 dimensions: weather, exposure year, growth (±20%), parameters
-    - Exposure scenarios (±10%)
     """)
 
 st.markdown("---")
@@ -79,7 +78,6 @@ with st.expander("Data Pipeline Overview", expanded=False):
     ├── Poisson GLM (dispersion ~1)
     ├── Monte Carlo simulation (S=1000)
     ├── 4 uncertainty dimensions
-    └── Exposure scenarios (±10%)
                         │
                         ▼
     Dashboard
@@ -93,38 +91,3 @@ with st.expander("Data Pipeline Overview", expanded=False):
     **Reproducibility:** Run `make all` to execute the complete pipeline.
     """)
 
-# Quick Stats
-st.markdown("---")
-st.subheader("Quick Navigation")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.info("""
-    **📊 Tripdata**
-
-    Explore CitiBike usage patterns:
-    - Trip volumes over time
-    - Station activity
-    - Seasonal trends
-    """)
-
-with col2:
-    st.info("""
-    **🚨 Crashdata**
-
-    Analyze NYC bike crashes:
-    - Temporal patterns
-    - Geographic distribution
-    - Severity breakdown
-    """)
-
-with col3:
-    st.info("""
-    **📈 Risk & Exposure**
-
-    Model predictions & validation:
-    - 2025 forecast
-    - Uncertainty bounds
-    - Proxy quality
-    """)

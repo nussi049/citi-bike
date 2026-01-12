@@ -232,7 +232,7 @@ This requires predicting only for areas with actual exposure, not historical are
 |                    MODEL FITTING                          |
 +----------------------------------------------------------+
 |  Training: 2021-2024 (excludes COVID 2020)                |
-|  Test: 2025 (true out-of-sample)                          |
+|  Backtest: 2025 (using known exposure)                    |
 |  Model: Poisson GLM                                       |
 +----------------------------------------------------------+
                               |
@@ -254,9 +254,9 @@ This requires predicting only for areas with actual exposure, not historical are
 | Period | Usage |
 |--------|-------|
 | 2021-2024 | Training (4 years, excludes COVID 2020) |
-| 2025 | Test (out-of-sample) |
+| 2025 | Backtest (using known exposure) |
 
-The model is trained **only** on 2021-2024 data. The year 2020 is excluded due to anomalous patterns during COVID. The 2025 predictions are true out-of-sample forecasts.
+The model is trained **only** on 2021-2024 data. The year 2020 is excluded due to anomalous patterns during COVID. The 2025 evaluation is a backtest using known exposure data, not a true out-of-sample forecast.
 
 ---
 

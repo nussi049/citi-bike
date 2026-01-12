@@ -78,9 +78,8 @@ EXPOSURE_CELL_HOUR_TEST = RISK_DIR / "exposure_cell_hour_2025.parquet"
 # Grid cells included in model (cells with sufficient exposure)
 CELLS_KEEP = RISK_DIR / "grid_cells_keep_2020_2024.parquet"
 
-# Exposure scenario analysis (-10%, actual, +10%)
+# Monte Carlo simulation results with scenarios
 MC_2025_SCENARIOS = RISK_DIR / "risk_mc_2025_totals_bike_all_scenarios.parquet"
-EXPOSURE_SCENARIOS_SUMMARY = RISK_DIR / "risk_exposure_scenarios_summary.parquet"
 
 # =============================================================================
 # PROXY VALIDATION (from proxy_validation.py)

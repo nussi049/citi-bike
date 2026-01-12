@@ -50,7 +50,7 @@ class TripDataLoader:
     def download(self):
         """Download all ZIPs, extract, and delete ZIPs."""
         
-        log.info("Downloading yearly archives (2015-2023)...")
+        log.info("Downloading yearly archives (2013-2023)...")
         for year in YEAR_ARCHIVES:
             url = f"{S3_BASE}/{year}-citibike-tripdata.zip"
             zip_path = RAW_DIR / f"{year}-citibike-tripdata.zip"

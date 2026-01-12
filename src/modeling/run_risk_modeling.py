@@ -64,7 +64,7 @@ MODEL SPECIFICATION:
 
     Family: Poisson (dispersion ~1, no overdispersion)
     Training: 2021-2024 (4 years, excludes COVID 2020)
-    Testing: 2025 (true out-of-sample)
+    Backtest: 2025 (using known exposure data)
 
 Usage:
     python src/modeling/run_risk_modeling.py
@@ -102,7 +102,7 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 # -----------------------------
 GRID_DEG = 0.025
 TMIN = "2021-01-01"  # Excludes COVID year 2020 (had highest summer crash rate)
-TMAX_TRAIN = "2025-01-01"  # Training: 2020-2024 only
+TMAX_TRAIN = "2025-01-01"  # Training: 2021-2024 only
 TMAX = "2026-01-01"        # For exposure data collection
 
 DB_PATH = OUT_DIR / f"analysis_bike_all_grid{int(GRID_DEG*10000):04d}.duckdb"
@@ -209,7 +209,7 @@ print(crash_check)
 # Check if we have any crashes
 if crash_check['n'].iloc[0] == 0:
     print("\n" + "="*70)
-    print("⚠️  CRITICAL ERROR: NO BIKE CRASHES FOUND!")
+    print("CRITICAL ERROR: NO BIKE CRASHES FOUND!")
     print("="*70)
     print("\nPossible causes:")
     print("  1. crash_time field is NULL or incorrectly formatted in crashes.parquet")
@@ -254,7 +254,7 @@ if FORCE_REBUILD:
 # ============================================================================
 N_INTERP_POINTS = 5  # Number of interpolation points (including start/end)
 
-# Build training exposure (2020-2024 only)
+# Build training exposure (2021-2024 only)
 if exposure_train_path.exists():
     print("Exists, skipping:", exposure_train_path)
 else:
@@ -634,7 +634,7 @@ print("Wrote:", cells_keep_path)
 # Aggregates hourly data to daily level to reduce RAM usage from ~2.8M to ~117K rows
 # This is sufficient for GLM training since hour-of-day is not a critical feature
 print("\nBuilding DAILY training grid (cells × days CROSS JOIN)...")
-print("This creates ~117K rows (64 cells × 1826 days)...")
+print("This creates cells × days rows for GLM training...")
 
 con.execute(f"""
 COPY (
@@ -822,7 +822,7 @@ train_df["log1p_exposure"] = np.log1p(train_df["exposure_min"].values)
 train_df["dow"] = train_df["dow"].astype(int).astype("category")
 train_df["month"] = train_df["month"].astype(int).astype("category")
 
-# CRITICAL: Compute normalization statistics from TRAINING DATA ONLY (2020-2024)
+# CRITICAL: Compute normalization statistics from TRAINING DATA ONLY (2021-2024)
 # These statistics will be applied to test data (2025) to prevent data leakage
 weather_stats = {}
 for col in weather_cols:
@@ -950,7 +950,7 @@ TO '{cells_2025_path.as_posix()}'
 
 n_cells_2025 = con.execute(f"SELECT COUNT(*) FROM read_parquet('{cells_2025_path.as_posix()}')").fetchone()[0]
 n_cells_train = con.execute(f"SELECT COUNT(*) FROM read_parquet('{cells_keep_path.as_posix()}')").fetchone()[0]
-print(f"Training cells (2020-2024): {n_cells_train}")
+print(f"Training cells (2021-2024): {n_cells_train}")
 print(f"Cells with 2025 exposure:   {n_cells_2025}")
 print(f"Coverage: {n_cells_2025/n_cells_train*100:.1f}% of training cells active in 2025")
 
@@ -1038,7 +1038,6 @@ import gc  # For explicit garbage collection to save RAM
 from numpy.random import default_rng
 
 rng = default_rng(42)
-S = 30  # Monte Carlo simulations (reduced from 50 for RAM; still sufficient for CI)
 
 # ============================================================================
 # STEP 1: Load Weather for ALL Years (by day-of-year) - DAILY AGGREGATION
@@ -1117,7 +1116,7 @@ print("\n" + "="*70)
 print("EXTRACTING EXPOSURE FOR ALL YEARS (2020-2025)")
 print("="*70)
 
-# Extract 2020-2024 from training data
+# Extract 2021-2024 from training data
 exposure_train_years = con.execute(f"""
 SELECT
     cell_id,
@@ -1420,32 +1419,6 @@ cmp_path = OUT_DIR / "model_comparison_bike_all.parquet"
 cmp.to_parquet(cmp_path, index=False)
 print("\nSaved:", cmp_path)
 
-# Create summary for dashboard (aggregated view)
-# Group by sampled dimensions to show effect of each
-print("\n" + "="*70)
-print("CREATING DASHBOARD SUMMARY")
-print("="*70)
-
-# Summary by exposure year (for dashboard box plot)
-scenario_summary = mc_df.groupby(['exposure_year'])['total_2025'].agg([
-    ('q05', lambda x: np.quantile(x, 0.05)),
-    ('q50', lambda x: np.quantile(x, 0.50)),
-    ('q95', lambda x: np.quantile(x, 0.95)),
-    ('mean', 'mean'),
-    ('std', 'std')
-]).reset_index()
-
-# Add columns for dashboard compatibility
-scenario_summary['model'] = 'poisson'
-scenario_summary['exposure_scenario'] = scenario_summary['exposure_year'].astype(str) + "_random"
-scenario_summary['exposure_multiplier'] = 1.0  # Mixed, but we keep for compatibility
-
-scenario_summary_path = OUT_DIR / "risk_exposure_scenarios_summary.parquet"
-scenario_summary.to_parquet(scenario_summary_path, index=False)
-print("Saved:", scenario_summary_path)
-
-print("\nSummary by Exposure Year (Poisson):")
-print(scenario_summary[['exposure_year', 'q05', 'q50', 'q95']])
 
 
 # In[ ]:
@@ -1509,7 +1482,7 @@ print(f"Total 2025 crashes (all NYC):           {obs_all:,.0f}")
 print(f"Crashes in training cells:              {obs_train_cells:,.0f} ({obs_train_cells/obs_all*100:.1f}%)")
 print(f"Crashes in 2025-ACTIVE cells (eval):    {obs_in_cells:,.0f} ({obs_in_cells/obs_all*100:.1f}%)")
 print("="*70)
-print("✓ Prediction and observed use SAME cell set (2025-active cells)")
+print("Prediction and observed use SAME cell set (2025-active cells)")
 print("  This ensures apples-to-apples comparison for insurance use case.")
 print("="*70)
 
