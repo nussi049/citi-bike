@@ -39,6 +39,9 @@ from pathlib import Path
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# Fixed random seed for reproducibility of coordinate imputation
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
@@ -270,7 +273,7 @@ def clean_crashes(con: duckdb.DuckDBPyConnection) -> None:
 
         elif row['coord_type'] == 'impute_citywide':
             # Sample from valid crash distribution (citywide)
-            sample = valid_crashes.sample(n=1)
+            sample = valid_crashes.sample(n=1, random_state=RANDOM_SEED)
             crashes.at[idx, 'lat_clean'] = sample['lat_clean'].iloc[0]
             crashes.at[idx, 'lng_clean'] = sample['lng_clean'].iloc[0]
 
