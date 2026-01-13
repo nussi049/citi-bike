@@ -238,7 +238,7 @@ See [src/modeling/README.md](src/modeling/README.md) for detailed model document
 
 **Note on 2025 Observed Data:**
 
-The observed crash count for 2025 (~5,550 in model cells) appears lower than model predictions (~6,100). This may be partly explained by:
+The observed crash count for 2025 (~5,550 in model cells) appears lower than model predictions (~5.700). This may be partly explained by:
 
 1. **Reporting Delays (Nachmeldelücken)**: Crash data from late 2025 (Nov/Dec) may not yet be fully reported as of early 2026.
 
