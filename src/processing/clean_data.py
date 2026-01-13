@@ -273,7 +273,7 @@ def clean_crashes(con: duckdb.DuckDBPyConnection) -> None:
 
         elif row['coord_type'] == 'impute_citywide':
             # Sample from valid crash distribution (citywide)
-            sample = valid_crashes.sample(n=1, random_state=RANDOM_SEED)
+            sample = valid_crashes.sample(n=1)
             crashes.at[idx, 'lat_clean'] = sample['lat_clean'].iloc[0]
             crashes.at[idx, 'lng_clean'] = sample['lng_clean'].iloc[0]
 
