@@ -27,6 +27,7 @@ from src.dashboard.lib.settings import (
     BIKE_COUNTERS,
     BIKE_COUNTS_HOURLY,
     CELLS_KEEP,
+    RISK_DIR,
 )
 
 
@@ -79,6 +80,16 @@ def rate_per_100k(y: float, exposure_min: float) -> float:
     if exposure_min <= 0:
         return float("nan")
     return (y / exposure_min) * 100000.0
+
+
+@st.cache_data(show_spinner=False)
+def load_model_meta() -> dict:
+    """Load model metadata including exposure coefficient."""
+    meta_path = RISK_DIR / "model_meta_bike_all.json"
+    if not meta_path.exists():
+        return {}
+    with open(meta_path) as f:
+        return json.load(f)
 
 
 # -----------------------------
@@ -1388,7 +1399,13 @@ with st.expander("Uncertainty Quantification: What's Captured & What's Not"):
 
 
 with st.expander("Why Grid-Level Modeling? (Grid vs. Borough)"):
-    st.markdown("""
+    # Load exposure coefficient from model metadata
+    model_meta = load_model_meta()
+    beta = model_meta.get("exposure_coefficient", float("nan"))
+    # Calculate effect of doubling exposure: 2^beta - 1
+    doubling_effect = (2 ** beta - 1) * 100 if not math.isnan(beta) else float("nan")
+
+    st.markdown(f"""
     ### Design Decision: Grid-Level vs. Borough-Level
 
     Both models would operate at **daily resolution**. The only difference is **spatial granularity**:
@@ -1417,9 +1434,9 @@ with st.expander("Why Grid-Level Modeling? (Grid vs. Borough)"):
     > is assumed to follow CitiBike station density—plausible since infrastructure follows demand.
 
     **4. Exposure as Feature (not Offset)**
-    > Exposure is modeled as a feature: `log1p(exposure_min)` with estimated coefficient β.
+    > Exposure is modeled as a feature: `log1p(exposure_min)` with estimated coefficient β = {beta:.2f}.
     > This allows: (1) including days with exposure=0, (2) estimating the exposure elasticity.
-    > With β ≈ 0.15, we have strong diminishing returns: doubling exposure → only ~11% more crashes.
+    > With β = {beta:.2f}, we have diminishing returns: doubling exposure → only ~{doubling_effect:.0f}% more crashes.
 
     **5. Backtest Validation**
     > The model predicts for ALL days in model cells (not just days with exposure).
@@ -1432,7 +1449,12 @@ with st.expander("Why Grid-Level Modeling? (Grid vs. Borough)"):
     """)
 
 with st.expander("Technical Details: Model Specification"):
-    st.markdown("""
+    # Reuse model_meta from previous expander or load again
+    if 'model_meta' not in dir() or not model_meta:
+        model_meta = load_model_meta()
+    beta = model_meta.get("exposure_coefficient", float("nan"))
+
+    st.markdown(f"""
     ### GLM Specification (Daily Aggregation)
 
     **Model Family:** Poisson (dispersion ~1 confirms no overdispersion)
@@ -1458,7 +1480,7 @@ with st.expander("Technical Details: Model Specification"):
     **Exposure as Feature (not Offset):**
     - `log1p(exposure)` handles exposure=0 gracefully (log1p(0) = 0)
     - Coefficient β is estimated from data (not fixed at 1)
-    - β ≈ 0.15 (diminishing returns)
+    - β = {beta:.2f} (diminishing returns)
 
     **Key Components:**
 
@@ -1471,8 +1493,8 @@ with st.expander("Technical Details: Model Specification"):
     | `lat_n×lng_n` | Interaction | Diagonal spatial patterns |
     | `temp, prcp, snow, wspd` | Z-scored weather | Weather impact on crashes |
     | `trend` | Years since 2021-01-01 | Temporal trend in crash rates |
-    | `log1p_exposure` | Exposure feature | Estimated coefficient |
-                
+    | `log1p_exposure` | Exposure feature | Estimated coefficient (β = {beta:.2f}) |
+
     """)
 
 
