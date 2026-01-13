@@ -1,6 +1,7 @@
 # src/dashboard/pages/3_risk_exposure.py
 from __future__ import annotations
 
+import os
 import json
 import math
 
@@ -28,6 +29,22 @@ from src.dashboard.lib.settings import (
     CELLS_KEEP,
 )
 
+
+# -----------------------------
+# Password protection (shared with app.py)
+# -----------------------------
+def check_password() -> bool:
+    password = os.environ.get("DASHBOARD_PASSWORD")
+    if not password:
+        return True
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if st.session_state.authenticated:
+        return True
+    st.warning("Please login on the main page first.")
+    st.stop()
+
+check_password()
 
 # -----------------------------
 # Page config
@@ -878,7 +895,7 @@ chart = (
     )
     .properties(height=360)
 )
-st.altair_chart(chart, width="stretch")
+st.altair_chart(chart, use_container_width=True)
 
 # Monthly deviation analysis
 st.markdown("#### Monthly Prediction Error Analysis (Poisson)")

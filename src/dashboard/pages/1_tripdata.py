@@ -1,9 +1,24 @@
+import os
 import streamlit as st
 import pandas as pd
 import altair as alt
 
 from src.dashboard.lib.db import get_con
 from src.dashboard.lib.settings import TRIPS_BOROUGH_HOUR, WEATHER_GLOB
+
+# Password protection (shared with app.py)
+def check_password() -> bool:
+    password = os.environ.get("DASHBOARD_PASSWORD")
+    if not password:
+        return True
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if st.session_state.authenticated:
+        return True
+    st.warning("Please login on the main page first.")
+    st.stop()
+
+check_password()
 
 st.title("Citi Bike Trips (usage & seasonality)")
 
